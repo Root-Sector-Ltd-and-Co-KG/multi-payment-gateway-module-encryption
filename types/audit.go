@@ -1,7 +1,6 @@
-package audit
+package types
 
 import (
-	"context"
 	"time"
 )
 
@@ -15,13 +14,4 @@ type AuditEvent struct {
 	DEKVersion int                    `json:"dek_version" bson:"dek_version"`
 	Context    map[string]string      `json:"context" bson:"context"`
 	Metadata   map[string]interface{} `json:"metadata" bson:"metadata"`
-}
-
-// Logger defines the interface for logging encryption-related events
-type Logger interface {
-	// LogEvent logs an audit event
-	LogEvent(ctx context.Context, event *AuditEvent) error
-
-	// GetEvents retrieves audit events based on filters
-	GetEvents(ctx context.Context, filters map[string]interface{}) ([]*AuditEvent, error)
 }
