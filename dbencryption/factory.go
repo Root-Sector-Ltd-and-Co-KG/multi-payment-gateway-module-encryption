@@ -5,10 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/root-sector/multi-payment-gateway-module-encryption/audit"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/cache/storage"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/dek"
-	dekstore "github.com/root-sector/multi-payment-gateway-module-encryption/dek/store"
 	"github.com/root-sector/multi-payment-gateway-module-encryption/interfaces"
 	"github.com/root-sector/multi-payment-gateway-module-encryption/kms"
 	encTypes "github.com/root-sector/multi-payment-gateway-module-encryption/types"
@@ -17,6 +13,18 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
+
+// kmsProviderAdapter adapts kms.Provider to dek.KMSServiceGetter
+type kmsProviderAdapter struct {
+	provider kms.Provider
+}
+
+// GetKMSProvider implements dek.KMSServiceGetter by returning the embedded provider.
+func (a *kmsProviderAdapter) GetKMSProvider(ctx context.Context, scope string, orgID string) (kms.Provider, error) {
+	// This adapter assumes the provider is already initialized and valid for the context.
+	// It doesn't need to fetch based on scope/orgID here.
+	return a.provider, nil
+}
 
 // ZerologAdapter adapts zerolog to dbencryption.Logger interface
 type ZerologAdapter struct {
@@ -118,126 +126,4 @@ func (a *StorageAdapter) DeleteDEK(ctx context.Context, scope, id string) error 
 
 func (a *StorageAdapter) ListDEKs(ctx context.Context, scope string) ([]*encTypes.DEKInfo, error) {
 	return a.store.ListDEKs(ctx, scope)
-}
-
-// createSharedComponents creates common components used by both system and organization processors
-func createSharedComponents(cfg *processorConfig) (kms.Provider, interfaces.AuditLogger, interfaces.Storage, interfaces.DEKService, error) {
-	// Create audit logger (metrics support pending)
-	auditLogger, err := createAuditLogger(cfg.scope, cfg.scopeID)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to create audit logger: %w", err)
-	}
-
-	// Create KMS provider if encryption is enabled
-	provider, err := createKMSProvider(cfg.config)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-
-	// Create cache storage with validation
-	store, err := createCacheStorage(cfg.config)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-
-	// Create MongoDB store
-	mongoStore := dekstore.NewMongoDBStore(cfg.db)
-
-	// Create DEK service with proper key handling
-	dekService, err := createDEKService(cfg.config, provider, auditLogger, mongoStore, store, cfg.encryptionKey)
-	if err != nil {
-		return nil, auditLogger, store, nil, err
-	}
-
-	return provider, auditLogger, store, dekService, nil
-}
-
-func createAuditLogger(scope, scopeID string) (interfaces.AuditLogger, error) {
-	logger := audit.NewStdoutAuditLogger()
-
-	// Create initial audit event to log scope information
-	ctx := context.Background()
-	event := &encTypes.AuditEvent{
-		EventType: "initialization",
-		Operation: "create_logger",
-		Status:    "success",
-		Context: map[string]string{
-			"scope":    scope,
-			"scope_id": scopeID,
-		},
-	}
-
-	if err := logger.LogEvent(ctx, event); err != nil {
-		return nil, fmt.Errorf("failed to log initial audit event: %w", err)
-	}
-
-	return logger, nil
-}
-
-func createKMSProvider(config *encTypes.EncryptionConfig) (kms.Provider, error) {
-	if !config.Enabled || config.Provider == "" {
-		return nil, nil
-	}
-
-	// Create credentials map
-	var credentials map[string]interface{}
-	if config.Credentials != nil {
-		credentials = make(map[string]interface{})
-		switch config.Provider {
-		case encTypes.ProviderAWS:
-			credentials["accessKeyId"] = config.Credentials.AccessKeyID
-			credentials["secretAccessKey"] = config.Credentials.SecretAccessKey
-			if config.Credentials.SessionToken != "" {
-				credentials["sessionToken"] = config.Credentials.SessionToken
-			}
-		case encTypes.ProviderGCP:
-			credentials["credentialsJson"] = config.Credentials.CredentialsJSON
-		case encTypes.ProviderVault:
-			credentials["token"] = config.Credentials.Token
-		case encTypes.ProviderAzure:
-			credentials["tenantId"] = config.Credentials.TenantID
-			credentials["clientId"] = config.Credentials.ClientID
-			credentials["clientSecret"] = config.Credentials.ClientSecret
-		}
-	}
-
-	provider, err := kms.NewProvider(kms.Config{
-		Type:         config.Provider,
-		KeyID:        config.KeyID,
-		Region:       config.Region,
-		Credentials:  credentials,
-		VaultAddress: config.VaultAddress,
-		VaultMount:   config.VaultMount,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create KMS provider: %w", err)
-	}
-
-	return provider, nil
-}
-
-func createCacheStorage(config *encTypes.EncryptionConfig) (interfaces.Storage, error) {
-	if !config.Cache.Enabled {
-		return nil, nil
-	}
-
-	// Validate TTL
-	if config.Cache.TTL < 1 {
-		return nil, fmt.Errorf("cache TTL must be at least 1 minute")
-	}
-
-	// Create memory adapter with default configuration
-	store := storage.NewMemoryAdapter()
-
-	return store, nil
-}
-
-func createDEKService(config *encTypes.EncryptionConfig, provider kms.Provider, auditLogger interfaces.AuditLogger, store interfaces.DEKStore, cacheStore interfaces.Storage, encryptionKey []byte) (interfaces.DEKService, error) {
-	// Create DEK service
-	dekService, err := dek.NewService(config, provider, auditLogger, store, cacheStore, encryptionKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DEK service: %w", err)
-	}
-
-	return dekService, nil
 }

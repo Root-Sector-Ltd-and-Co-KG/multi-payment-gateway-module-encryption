@@ -8,41 +8,55 @@ import (
 	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
 )
 
-// GarnetAdapter adapts the internal cache to our encryption cache interface
+// GarnetAdapter adapts the internal cache to our encryption cache interface, adding namespacing.
 type GarnetAdapter struct {
-	client interfaces.Cache
+	client    interfaces.Cache
+	keyPrefix string // Namespace prefix for keys
 }
 
-// NewGarnetAdapter creates a new adapter for the internal cache
-func NewGarnetAdapter(client interfaces.Cache) interfaces.Storage {
+// NewGarnetAdapter creates a new adapter for the internal cache with an optional key prefix.
+// If keyPrefix is empty, no prefixing is applied.
+func NewGarnetAdapter(client interfaces.Cache, keyPrefix string) interfaces.Storage {
 	return &GarnetAdapter{
-		client: client,
+		client:    client,
+		keyPrefix: keyPrefix,
 	}
 }
 
-// Get retrieves a value from storage
+// prefixedKey returns the key with the prefix prepended.
+func (g *GarnetAdapter) prefixedKey(key string) string {
+	return g.keyPrefix + key
+}
+
+// Get retrieves a value from storage using the prefixed key.
 func (g *GarnetAdapter) Get(ctx context.Context, key string, value interface{}) error {
-	return g.client.Get(ctx, key, value)
+	return g.client.Get(ctx, g.prefixedKey(key), value)
 }
 
-// Set stores a value in storage
+// Set stores a value in storage using the prefixed key.
 func (g *GarnetAdapter) Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
-	return g.client.Set(ctx, key, value, ttl)
+	return g.client.Set(ctx, g.prefixedKey(key), value, ttl)
 }
 
-// Delete removes a value from storage
+// Delete removes a value from storage using the prefixed key.
 func (g *GarnetAdapter) Delete(ctx context.Context, key string) error {
-	return g.client.Delete(ctx, key)
+	return g.client.Delete(ctx, g.prefixedKey(key))
 }
 
-// Clear removes all values from storage
+// Clear removes all values from storage that match the prefix.
 func (g *GarnetAdapter) Clear(ctx context.Context) error {
-	keys, err := g.client.Keys(ctx, "*")
+	// Fetch keys matching the prefix pattern
+	pattern := g.keyPrefix + "*"
+	keys, err := g.client.Keys(ctx, pattern)
 	if err != nil {
 		return err
 	}
+	// Delete only the keys matching the prefix
 	for _, key := range keys {
+		// Note: The key returned by Keys already includes the prefix
 		if err := g.client.Delete(ctx, key); err != nil {
+			// Consider logging the error and continuing? Or return immediately?
+			// Returning immediately for now.
 			return err
 		}
 	}
@@ -63,14 +77,24 @@ func (g *GarnetAdapter) GetStats(ctx context.Context) types.CacheStats {
 func (g *GarnetAdapter) ClearExpiredKeys(ctx context.Context) (int, error) {
 	// We don't have direct access to expiration info in the garnet client,
 	// so just call Clear() - this is a limitation of this adapter
-	err := g.Clear(ctx)
-
-	// We can't know how many were expired, so return 0 with any error
+	// We don't have direct access to expiration info in the garnet client.
+	// This implementation clears all keys matching the prefix, regardless of expiry.
+	// It's a best-effort approach based on the Clear method.
+	pattern := g.keyPrefix + "*"
+	keys, err := g.client.Keys(ctx, pattern)
 	if err != nil {
-		return 0, err
+		return 0, err // Return 0 count on error fetching keys
 	}
 
-	// Since we can't determine which keys were expired, return 0
-	// This is a limitation of the implementation
-	return 0, nil
+	count := 0
+	for _, key := range keys {
+		if err := g.client.Delete(ctx, key); err != nil {
+			// Log or handle partial failure? Returning error for now.
+			return count, err // Return count so far and the error
+		}
+		count++
+	}
+
+	// Return the count of keys that were deleted (matching the prefix)
+	return count, nil
 }

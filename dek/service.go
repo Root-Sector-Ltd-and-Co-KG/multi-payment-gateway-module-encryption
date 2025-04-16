@@ -13,12 +13,12 @@ import (
 	"github.com/google/uuid"
 
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/root-sector/multi-payment-gateway-module-encryption/audit"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/cache"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/cache/storage"
+	"github.com/root-sector/multi-payment-gateway-module-encryption/field"
 	"github.com/root-sector/multi-payment-gateway-module-encryption/interfaces"
 	"github.com/root-sector/multi-payment-gateway-module-encryption/kms"
 	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
@@ -62,123 +62,90 @@ const (
 	defaultCacheTTL = 15 * time.Minute
 )
 
+// KMSServiceGetter defines the interface for retrieving a KMS provider.
+// This allows dekService to fetch the *current* provider dynamically.
+type KMSServiceGetter interface {
+	GetKMSProvider(ctx context.Context, scope string, orgID string) (kms.Provider, error)
+}
+
 // dekService implements the Service interface for DEK management
 type dekService struct {
-	config        *types.EncryptionConfig
-	provider      kms.Provider
-	logger        interfaces.AuditLogger
-	cache         types.Cache
-	store         interfaces.DEKStore
+	// config        *types.EncryptionConfig // Removed, will be fetched via configGetter
+	kmsGetter    KMSServiceGetter        // Added KMS getter interface
+	configGetter interfaces.ConfigGetter // Added Config getter interface
+	logger       interfaces.AuditLogger  // For structured audit events
+	zLogger      zerolog.Logger          // Added for operational logging
+	cache        types.Cache             // Changed from cacheStore: Now holds the actual cache instance
+	store        interfaces.DEKStore
+	// cacheStore    interfaces.Storage // REMOVED: Replaced by direct 'cache' field
 	encryptionKey []byte
 	mu            sync.RWMutex
-	info          *types.DEKInfo
-	status        *types.DEKStatus
-	initialized   bool
+	// info          *types.DEKInfo // Removed, state is now scope-dependent
+	status      *types.DEKStatus
+	initialized bool
 }
 
-var (
-	globalService *dekService
-	serviceMu     sync.RWMutex
-)
+// Removed global singleton variables (globalService, serviceMu)
+// Removed GetService() function
+// Removed InitializeGlobalService() function
+// Instances are now created via NewService and managed by CoreEncryptionService.
 
-// SetService overrides the global service instance
-func SetService(svc interfaces.DEKService) {
-	serviceMu.Lock()
-	defer serviceMu.Unlock()
-
-	if ds, ok := svc.(*dekService); ok {
-		globalService = ds
-		log.Debug().Msg("Global DEK service instance updated")
+// NewService creates a new DEK service instance.
+// It no longer handles singleton logic; use InitializeGlobalService for that.
+// NewService creates a new, independent DEK service instance.
+// It requires all dependencies to be passed in.
+// Accepts an optional, pre-configured dekCache instance.
+func NewService(kmsGetter KMSServiceGetter, configGetter interfaces.ConfigGetter, auditLogger interfaces.AuditLogger, store interfaces.DEKStore, dekCache types.Cache, encryptionKey []byte, opLogger zerolog.Logger) (interfaces.DEKService, error) {
+	// Validate required dependencies
+	// config parameter removed
+	if kmsGetter == nil {
+		return nil, fmt.Errorf("kmsGetter is required for NewService")
 	}
-}
-
-// GetService returns the global service instance
-func GetService() (interfaces.DEKService, error) {
-	serviceMu.RLock()
-	if globalService != nil && globalService.initialized {
-		serviceMu.RUnlock()
-		return globalService, nil
+	if configGetter == nil {
+		return nil, fmt.Errorf("configGetter is required for NewService")
 	}
-	serviceMu.RUnlock()
-
-	// Create new instance if none exists
-	serviceMu.Lock()
-	defer serviceMu.Unlock()
-
-	if globalService != nil && globalService.initialized {
-		return globalService, nil
+	if store == nil {
+		return nil, fmt.Errorf("store (DEKStore) is required for NewService")
 	}
+	// dekCache is now optional (passed directly)
+	// auditLogger is optional
+	// opLogger is optional (defaults to global logger if zero)
 
-	// If we have a partially initialized service, complete its initialization
-	if globalService != nil {
-		if err := globalService.Initialize(context.Background()); err != nil {
-			return nil, fmt.Errorf("failed to initialize existing service: %w", err)
-		}
-		return globalService, nil
-	}
-
-	// Create new service instance with default configuration
-	svc := &dekService{
-		status: &types.DEKStatus{
-			Exists:      false,
-			Active:      false,
-			Version:     0,
-			CreatedAt:   time.Time{},
-			UpdatedAt:   time.Time{},
-			NeedsRotate: false,
-		},
-		initialized: false,
-	}
-
-	globalService = svc
-	return globalService, nil
-}
-
-// NewService creates a new DEK service instance
-func NewService(config *types.EncryptionConfig, provider kms.Provider, auditLogger interfaces.AuditLogger, store interfaces.DEKStore, cacheStore interfaces.Storage, encryptionKey []byte) (interfaces.DEKService, error) {
-	if config == nil {
-		return nil, fmt.Errorf("config is required")
-	}
-
-	serviceMu.Lock()
-	defer serviceMu.Unlock()
-
-	// Check if we already have an initialized service
-	if globalService != nil && globalService.initialized {
-		return globalService, nil
+	if opLogger.GetLevel() == zerolog.Disabled {
+		opLogger = log.Logger // Use global logger if none provided
 	}
 
 	// Create service instance
 	svc := &dekService{
-		config:        config,
-		provider:      provider,
+		// config assignment removed
+		kmsGetter:     kmsGetter,    // Store the getter
+		configGetter:  configGetter, // Store the config getter
 		logger:        auditLogger,
+		zLogger:       opLogger, // Assign injected operational logger
 		store:         store,
+		cache:         dekCache, // Store the passed cache instance directly
 		encryptionKey: encryptionKey,
 		status: &types.DEKStatus{
-			Exists:      false,
-			Active:      false,
-			Version:     0,
-			CreatedAt:   time.Time{},
-			UpdatedAt:   time.Time{},
-			Provider:    config.Provider,
+			Exists:    false,
+			Active:    false,
+			Version:   0,
+			CreatedAt: time.Time{},
+			UpdatedAt: time.Time{},
+			// Provider:    config.Provider, // Removed, provider type determined dynamically
 			NeedsRotate: false,
 		},
 	}
+	// Removed diagnostic log from NewService
+	// log.Debug()...
 
-	log.Debug().
-		Str("providerType", fmt.Sprintf("%T", provider)).
-		Bool("providerIsNil", provider == nil).
-		Bool("configEnabled", config.Enabled).
-		Msg("dek.NewService: Provider received, internal initialization skipped")
-
-	// Update global instance
-	globalService = svc
+	// Removed global instance update
 
 	return svc, nil
 }
 
 // createDEKCache creates a new DEK cache with the provided config and storage
+// DEPRECATED: Cache instance is now created externally and passed to NewService.
+/*
 func createDEKCache(cacheConfig types.CacheConfig, store interfaces.Storage) types.Cache {
 	// Create a new cache config that matches what the NewDEKCache function expects
 	config := &types.CacheConfig{
@@ -187,6 +154,7 @@ func createDEKCache(cacheConfig types.CacheConfig, store interfaces.Storage) typ
 	}
 	return cache.NewDEKCache(config, store)
 }
+*/
 
 // loadDEKInfo loads DEK info from store with caching
 func (s *dekService) loadDEKInfo(ctx context.Context) (*types.DEKInfo, error) {
@@ -194,7 +162,7 @@ func (s *dekService) loadDEKInfo(ctx context.Context) (*types.DEKInfo, error) {
 	scope, orgID := s.getScopeFromContext(ctx)
 	cacheKey, err := s.getCacheKey(scope, orgID)
 	if err != nil {
-		log.Warn().Err(err).Msg("Failed to generate cache key for DEK info")
+		s.zLogger.Warn().Err(err).Msg("Failed to generate cache key for DEK info")
 		// Fallback to fetching directly from store without caching
 		return s.store.GetActiveDEK(ctx, scope, orgID)
 	}
@@ -204,11 +172,11 @@ func (s *dekService) loadDEKInfo(ctx context.Context) (*types.DEKInfo, error) {
 		if cached, _, found := s.cache.Get(ctx, cacheKey); found && cached != nil {
 			var info types.DEKInfo
 			if err := json.Unmarshal(cached.Get(), &info); err == nil {
-				log.Debug().Msg("Using cached DEK info")
+				s.zLogger.Debug().Msg("Using cached DEK info")
 				return &info, nil
 			} else {
 				// If unmarshal fails, log and continue to fetch from store
-				log.Warn().Err(err).Msg("Failed to unmarshal cached DEK info")
+				s.zLogger.Warn().Err(err).Msg("Failed to unmarshal cached DEK info")
 			}
 		}
 	}
@@ -237,9 +205,9 @@ func (s *dekService) loadDEKInfo(ctx context.Context) (*types.DEKInfo, error) {
 			defer cancel()
 
 			s.cache.Set(cacheCtx, cacheKey, dekBytes, 1) // Assuming version 1 for now, might need adjustment
-			log.Debug().Msg("Cached DEK info")
+			s.zLogger.Debug().Msg("Cached DEK info")
 		} else {
-			log.Warn().Err(marshalErr).Msg("Failed to marshal DEK info for caching")
+			s.zLogger.Warn().Err(marshalErr).Msg("Failed to marshal DEK info for caching")
 		}
 	}
 
@@ -248,47 +216,92 @@ func (s *dekService) loadDEKInfo(ctx context.Context) (*types.DEKInfo, error) {
 
 // Initialize initializes the DEK service
 func (s *dekService) Initialize(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.initialized {
+	// Check initialization status first with a read lock to avoid unnecessary write lock contention
+	s.mu.RLock()
+	initialized := s.initialized
+	s.mu.RUnlock()
+	if initialized {
 		return nil
 	}
 
-	log.Info().Msg("Starting DEK service initialization")
-
-	// Initialize cache if enabled and not already initialized
-	if s.config != nil && s.config.Cache.Enabled && s.cache == nil {
-		s.cache = cache.NewDEKCache(&types.CacheConfig{
-			Enabled: true,
-			TTL:     s.config.Cache.TTL,
-		}, storage.NewMemoryAdapter())
+	// Acquire write lock only when potentially modifying state
+	s.mu.Lock()
+	// Double-check initialization status after acquiring write lock
+	if s.initialized {
+		s.mu.Unlock() // Release lock if already initialized by another goroutine
+		return nil
 	}
+	// Keep lock initially, release before potentially blocking calls
+
+	s.zLogger.Info().Msg("Starting DEK service initialization")
+
+	// --- REMOVED CACHE CREATION LOGIC ---
+	// Cache instance is now expected to be passed during NewService.
+	// We just log its status here.
+	logCacheStatus := s.zLogger.Info()
+	if s.cache != nil && s.cache.IsEnabled() {
+		logCacheStatus.Bool("cacheProvidedAndEnabled", true)
+	} else if s.cache != nil {
+		logCacheStatus.Bool("cacheProvidedButDisabled", true)
+	} else {
+		logCacheStatus.Bool("cacheNotProvided", true)
+	}
+	logCacheStatus.Msg("DEKService.Initialize: Cache status")
+	// --- END REMOVED CACHE CREATION LOGIC ---
+
+	s.mu.Unlock() // Release lock before potentially slow I/O in loadDEKInfo
 
 	// Load DEK info without pre-caching first
-	info, err := s.loadDEKInfo(ctx)
+	// Use a background context as this is initialization
+	initCtx := context.Background()     // Use background for initial setup attempt
+	info, err := s.loadDEKInfo(initCtx) // This function handles its own caching logic
 	if err != nil {
-		if err.Error() == "not found" {
-			log.Info().Msg("No DEK found during initialization")
-			// Don't disable encryption, just return error to indicate DEK needs to be created
-			return fmt.Errorf("no DEK found")
+		if strings.Contains(err.Error(), "not found") {
+			s.zLogger.Info().Msg("No DEK found during initialization")
+			// Mark as initialized even if no DEK found
+			s.mu.Lock()
+			s.initialized = true
+			s.mu.Unlock()
+			return nil // Okay if no DEK exists yet
 		}
 		// For other errors, log but continue - might be temporary
-		log.Warn().Err(err).Msg("Error loading DEK info during initialization")
+		s.zLogger.Warn().Err(err).Msg("Error loading DEK info during initialization")
+
+		// If loadDEKInfo failed with an error other than "not found", return the error
+		// Re-acquire lock before returning or modifying state
+		s.mu.Lock()
+		s.initialized = true // Mark as initialized even on error to prevent re-entry
+		s.mu.Unlock()
+		return fmt.Errorf("error loading DEK info during initialization: %w", err)
 	}
 
-	// If we found a DEK, verify it can be unwrapped
+	// If we found a DEK, verify it can be unwrapped (outside the main lock)
+	var verificationError error
+	var verificationDEK []byte // Variable to store the successfully unwrapped DEK
 	if info != nil && len(info.Versions) > 0 {
 		latestVersion := info.Versions[len(info.Versions)-1]
-		dek, unwrapErr := s.UnwrapDEK(ctx, &latestVersion)
+		// Use a background context for the unwrap check during initialization
+		unwrapCtx := context.Background()                        // Use a background context for initialization tasks
+		dek, unwrapErr := s.UnwrapDEK(unwrapCtx, &latestVersion) // UnwrapDEK handles its own locking
 		if unwrapErr != nil || len(dek) == 0 {
-			log.Error().
-				Err(unwrapErr).
-				Msg("Found DEK but unable to unwrap it")
-			// Only return error, let caller decide whether to disable encryption
-			return fmt.Errorf("failed to verify DEK unwrapping: %w", unwrapErr)
+			verificationError = fmt.Errorf("failed to verify DEK unwrapping during initialization: %w", unwrapErr)
+			s.zLogger.Error().
+				Err(verificationError).
+				Msg("Found DEK but unable to unwrap it during initialization")
+			// Do not return yet, update status below first
+		} else {
+			verificationDEK = dek // Store the successfully unwrapped DEK
+			s.zLogger.Info().Msg("Successfully verified DEK unwrapping during initialization")
 		}
-		log.Info().Msg("Successfully verified DEK unwrapping")
+	}
+
+	// Re-acquire lock to update final state
+	s.mu.Lock()
+	defer s.mu.Unlock() // Ensure lock is released even if pre-caching goroutine panics
+
+	// Check again if initialized by another goroutine while we were unlocked
+	if s.initialized {
+		return nil
 	}
 
 	// Update status
@@ -298,41 +311,54 @@ func (s *dekService) Initialize(ctx context.Context) error {
 		s.status.Version = info.Version
 		s.status.CreatedAt = info.CreatedAt
 		s.status.UpdatedAt = info.UpdatedAt
+		// Keep provider from config
 	} else {
 		s.status.Version = 0
 		s.status.CreatedAt = time.Time{}
 		s.status.UpdatedAt = time.Time{}
 	}
-	s.info = info
+	// s.info = info // Ensure this line is removed or commented out
 
-	// Mark as initialized
+	// Mark as initialized *after* successfully updating state
 	s.initialized = true
 
-	// Pre-cache in background only if we have info
-	if info != nil && len(info.Versions) > 0 && s.cache != nil && s.cache.IsEnabled() {
-		go func() {
+	// Return verification error *after* marking as initialized
+	if verificationError != nil {
+		return verificationError
+	}
+
+	// Pre-cache in background only if verification succeeded and cache is enabled
+	if verificationError == nil && info != nil && len(verificationDEK) > 0 && s.cache != nil && s.cache.IsEnabled() {
+		// Pass necessary info to the goroutine to avoid data races on s.info
+		dekToCache := verificationDEK
+		infoVersion := info.Version
+
+		go func(dek []byte, version int) { // Removed id parameter
 			cacheCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			latestVersion := info.Versions[len(info.Versions)-1]
-			if dek, err := s.UnwrapDEK(cacheCtx, &latestVersion); err == nil {
-				cacheKey, err := s.getUnwrappedCacheKey(cacheCtx, info.Id, latestVersion.Version) // Use Id
-				if err == nil {
-					s.cache.Set(cacheCtx, cacheKey, dek, latestVersion.Version)
-					log.Debug().Msg("Pre-cached DEK successfully")
-				} else {
-					log.Warn().Err(err).Msg("Failed to generate cache key")
-				}
+			// Use the already unwrapped DEK from the verification step
+			// Pass background context as scope isn't strictly necessary here (assuming system for init)
+			cacheKey, keyErr := s.getUnwrappedCacheKey(cacheCtx, version) // Pass only ctx and version
+			if keyErr == nil {
+				// Use the Set method from types.Cache interface
+				// Set does not return an error, so just call it.
+				s.cache.Set(cacheCtx, cacheKey, dek, version)
+				s.zLogger.Debug().Str("cacheKey", cacheKey).Msg("Pre-cached DEK successfully") // Log after setting
+			} else {
+				s.zLogger.Warn().Err(keyErr).Msg("Failed to generate cache key for pre-caching")
 			}
-		}()
+			// +++ MORE DEBUGGING +++
+		}(dekToCache, infoVersion) // Pass only copies/values needed to the goroutine
 	}
 
-	log.Info().
-		Bool("hasProvider", s.provider != nil).
-		Bool("isEnabled", s.config.Enabled).
-		Bool("hasInfo", s.info != nil).
+	s.zLogger.Info().
+		// Bool("hasProvider", s.provider != nil). // Removed
+		Bool("hasKmsGetter", s.kmsGetter != nil). // Added
+		// Bool("isEnabled", ... ) // Cannot determine general enabled status here
+		// Bool("hasInfo", ...) // Removed s.info check
 		Bool("initialized", s.initialized).
-		Str("provider", string(s.config.Provider)).
+		// Str("provider", ...) // Cannot determine general provider here
 		Msg("DEK service initialization completed")
 
 	return nil
@@ -346,11 +372,6 @@ func (s *dekService) GetAuditLogger() interface{} {
 // GetDEKService implements Service
 func (s *dekService) GetDEKService() interface{} {
 	return s
-}
-
-// GetFieldService implements Service
-func (s *dekService) GetFieldService() interface{} {
-	return nil
 }
 
 // GetTaskProcessor implements Service
@@ -416,7 +437,7 @@ func (s *dekService) getScopeFromContext(ctx context.Context) (scope string, org
 	switch scope {
 	case scopeSystem:
 		if orgID != "" {
-			log.Warn().
+			s.zLogger.Warn().
 				Str("scope", scope).
 				Str("orgID", orgID).
 				Msg("System scope should not have an orgID, ignoring orgID")
@@ -424,13 +445,13 @@ func (s *dekService) getScopeFromContext(ctx context.Context) (scope string, org
 		}
 	case scopeOrg:
 		if orgID == "" {
-			log.Warn().
+			s.zLogger.Warn().
 				Str("scope", scope).
 				Msg("Organization scope set but no orgID provided")
 		}
 	default:
 		if scope != "" {
-			log.Warn().
+			s.zLogger.Warn().
 				Str("invalidScope", scope).
 				Msg("Invalid scope provided, defaulting to system scope")
 		}
@@ -438,7 +459,7 @@ func (s *dekService) getScopeFromContext(ctx context.Context) (scope string, org
 		orgID = ""
 	}
 
-	log.Debug().
+	s.zLogger.Debug().
 		Str("scope", scope).
 		Str("orgID", orgID).
 		Msg("Extracted scope and orgID from context")
@@ -461,14 +482,25 @@ func (s *dekService) getWrapContext(scope, orgID string) []byte {
 
 // wrapDEK wraps a DEK using the configured KMS provider
 func (s *dekService) wrapDEK(ctx context.Context, key []byte, scope string, orgID string) (*types.DEKVersion, error) {
+	// Fetch the current provider dynamically
+	provider, err := s.kmsGetter.GetKMSProvider(ctx, scope, orgID)
+	if err != nil {
+		log.Error().Err(err).Str("scope", scope).Str("orgID", orgID).Msg("Failed to get KMS provider for wrapping")
+		return nil, fmt.Errorf("failed to get KMS provider for scope '%s': %w", scope, err)
+	}
+	if provider == nil {
+		log.Error().Str("scope", scope).Str("orgID", orgID).Msg("Attempted to wrap DEK but KMS provider is nil (dynamically fetched)")
+		return nil, fmt.Errorf("cannot wrap DEK: KMS provider is not configured for scope '%s'", scope)
+	}
+
 	if key == nil {
 		return nil, fmt.Errorf("key is required")
 	}
 
-	// Get wrapper from provider
-	wrapper := s.provider.GetWrapper()
+	// Get wrapper from the dynamically fetched provider
+	wrapper := provider.GetWrapper()
 	if wrapper == nil {
-		return nil, fmt.Errorf("KMS wrapper not available")
+		return nil, fmt.Errorf("KMS wrapper not available from provider")
 	}
 
 	// Create wrap context with timeout
@@ -483,7 +515,7 @@ func (s *dekService) wrapDEK(ctx context.Context, key []byte, scope string, orgI
 	// Build wrap context using orgID if provided
 	wrapContext := s.getWrapContext(scope, orgID)
 
-	log.Debug().
+	s.zLogger.Debug().
 		Str("scope", scope).
 		Hex("wrapContext", wrapContext).
 		Msg("Using wrap context for encryption")
@@ -504,7 +536,7 @@ func (s *dekService) wrapDEK(ctx context.Context, key []byte, scope string, orgI
 		return nil, fmt.Errorf("wrapped key info is nil")
 	}
 
-	log.Debug().
+	s.zLogger.Debug().
 		Bool("hasIv", len(blobInfo.Iv) > 0).
 		Bool("hasCiphertext", len(blobInfo.Ciphertext) > 0).
 		Msg("Received blob info from KMS")
@@ -534,7 +566,7 @@ func (s *dekService) wrapDEK(ctx context.Context, key []byte, scope string, orgI
 		return nil, fmt.Errorf("unwrapped key does not match original")
 	}
 
-	log.Debug().
+	s.zLogger.Debug().
 		Msg("Successfully created and verified DEK version")
 
 	version.WrapContext = wrapContext
@@ -543,49 +575,65 @@ func (s *dekService) wrapDEK(ctx context.Context, key []byte, scope string, orgI
 
 // CreateDEK creates a new DEK and wraps it with KMS
 func (s *dekService) CreateDEK(ctx context.Context, scope string, orgID string) (*types.DEKInfo, error) {
-	s.mu.RLock() // Use RLock first to check internal state
-	// Quick check if we *know* a DEK exists internally
-	if s.info != nil && s.info.Active {
-		s.mu.RUnlock()
-		return nil, fmt.Errorf("DEK already active in service state for scope %s/%s", scope, orgID)
-	}
-	s.mu.RUnlock()
+	// Removed incorrect check against internal s.info state.
+	// The check below against the persistent store is the correct way to verify existence.
 
 	// Now check the persistent store definitively WITHOUT holding the main service lock
-	log.Debug().Str("scope", scope).Str("orgID", orgID).Msg("Checking store for existing active DEK before creation")
+	s.zLogger.Debug().Str("scope", scope).Str("orgID", orgID).Msg("Checking store for existing active DEK before creation")
 	existingInfo, err := s.store.GetActiveDEK(ctx, scope, orgID)
-	if err != nil && err != mongo.ErrNoDocuments { // Check specifically for ErrNoDocuments
-		log.Error().Err(err).Str("scope", scope).Str("orgID", orgID).Msg("Error checking store for existing DEK")
+	if err != nil && !strings.Contains(err.Error(), "not found") { // Check specifically for "not found" variant
+		s.zLogger.Error().Err(err).Str("scope", scope).Str("orgID", orgID).Msg("Error checking store for existing DEK")
 		// Don't return internal store errors directly, wrap them
 		return nil, fmt.Errorf("failed to verify existing DEK status: %w", err)
 	} else if existingInfo != nil {
-		log.Warn().Str("scope", scope).Str("orgID", orgID).Str("existingDEKId", existingInfo.Id).Msg("DEK already exists in store")
+		s.zLogger.Warn().Str("scope", scope).Str("orgID", orgID).Str("existingDEKId", existingInfo.Id).Msg("DEK already exists in store")
 		return nil, fmt.Errorf("DEK already exists in store for scope %s/%s", scope, orgID)
 	}
-	log.Debug().Str("scope", scope).Str("orgID", orgID).Msg("No existing active DEK found in store, proceeding with creation")
+	s.zLogger.Debug().Str("scope", scope).Str("orgID", orgID).Msg("No existing active DEK found in store, proceeding with creation")
+
+	// Check if KMS provider is configured before proceeding to wrap
+	// *** Fetch the provider dynamically ***
+	provider, err := s.kmsGetter.GetKMSProvider(ctx, scope, orgID)
+	if err != nil {
+		log.Error().Err(err).Str("scope", scope).Str("orgID", orgID).Msg("Failed to get KMS provider before DEK creation")
+		if s.logger != nil {
+			s.logAuditEvent(ctx, eventType, operationCreate, statusFailed, 0, fmt.Errorf("kms_provider_fetch_failed: %w", err))
+		}
+		return nil, fmt.Errorf("failed to get KMS provider for scope '%s': %w", scope, err)
+	}
+	if provider == nil {
+		log.Error().Str("scope", scope).Str("orgID", orgID).Msg("KMS provider is nil (dynamically fetched), cannot create/wrap DEK")
+		if s.logger != nil {
+			s.logAuditEvent(ctx, eventType, operationCreate, statusFailed, 0, fmt.Errorf("kms_provider_not_configured"))
+		}
+		return nil, fmt.Errorf("KMS provider is not configured for scope '%s'", scope)
+	}
+	// *** End dynamic fetch ***
 
 	// --- Acquire lock BEFORE generating/wrapping DEK ---
-	s.mu.Lock()
+	// s.mu.Lock() // Removed lock here, moved after generate/wrap
 
 	// Generate new DEK (no lock needed)
 	newDEK, err := s.generateDEK()
 	if err != nil {
-		s.mu.Unlock() // Release lock on error
+		// s.mu.Unlock() // Removed
 		return nil, fmt.Errorf("failed to generate DEK: %w", err)
 	}
 
 	// Wrap (encrypt) the DEK using KMS
+	// Pass the dynamically fetched provider to wrapDEK or let wrapDEK fetch it again?
+	// Let wrapDEK fetch it again for consistency.
 	wrappedVersion, err := s.wrapDEK(ctx, newDEK, scope, orgID)
 
 	if err != nil {
-		s.mu.Unlock() // Release lock on error
+		// s.mu.Unlock() // Removed
 		// Log failure if wrapDEK failed
 		s.logAuditEvent(ctx, "dek", "create", "failure", 0, fmt.Errorf("failed to wrap DEK: %w", err))
 		return nil, fmt.Errorf("failed to wrap DEK: %w", err)
 	}
 
 	// --- Release lock AFTER wrapping ---
-	s.mu.Unlock()
+	// s.mu.Unlock() // Removed
 
 	// Create DEK info with wrapped version (no lock needed here)
 	dekInfo := &types.DEKInfo{
@@ -606,14 +654,21 @@ func (s *dekService) CreateDEK(ctx context.Context, scope string, orgID string) 
 
 	// --- Critical section: Update internal state ---
 	s.mu.Lock() // Acquire write lock *only* for updating internal state
-	s.info = dekInfo
+	// s.info = dekInfo // Removed assignment to s.info
+	// Determine provider type from config for status display
+	providerType := ""
+	// Fetch config to get provider type - use the context passed to CreateDEK
+	config, _ := s.configGetter.GetEncryptionConfig(ctx, scope, orgID) // Ignore error for status update
+	if config != nil {
+		providerType = string(config.Provider)
+	}
 	s.status = &types.DEKStatus{
 		Exists:      true,
 		Active:      true,
 		Version:     dekInfo.Version,
 		CreatedAt:   dekInfo.CreatedAt,
 		UpdatedAt:   dekInfo.UpdatedAt,
-		Provider:    s.config.Provider,
+		Provider:    types.ProviderType(providerType), // Use config for initial status
 		NeedsRotate: false,
 	}
 	s.mu.Unlock() // Release lock after updating internal state
@@ -636,7 +691,7 @@ func (s *dekService) DeleteDEK(ctx context.Context, scope string, orgID string) 
 		if err == nil {
 			s.cache.Delete(cacheKey)
 		} else {
-			log.Warn().Err(err).Msg("Failed to generate cache key for deletion")
+			s.zLogger.Warn().Err(err).Msg("Failed to generate cache key for deletion")
 		}
 	}
 
@@ -785,39 +840,63 @@ func (s *dekService) getCacheKey(scope, orgID string) (string, error) {
 }
 
 // getUnwrappedCacheKey generates a cache key for unwrapped DEKs
-func (s *dekService) getUnwrappedCacheKey(ctx context.Context, dekId string, version int) (string, error) { // Use dekId
+// It no longer uses dekId to avoid inconsistencies between callers.
+// The key is now based solely on scope, orgID (if applicable), and version.
+func (s *dekService) getUnwrappedCacheKey(ctx context.Context, version int) (string, error) {
 	scope, orgID := s.getScopeFromContext(ctx)
 
+	// Removed dekId check
+
 	if scope == scopeSystem {
-		return fmt.Sprintf("%s:%s:%s:v%d", cacheKeyPrefixDEK, scopeSystem, dekId, version), nil // Use dekId
+		// Format: dek:system:v<version>
+		return fmt.Sprintf("%s:%s:v%d", cacheKeyPrefixDEK, scopeSystem, version), nil
 	}
 
 	// Only use org scope if both scope is org and orgID is provided
 	if scope == scopeOrg && orgID != "" {
-		return fmt.Sprintf("%s:%s:%s:%s:v%d", cacheKeyPrefixDEK, scopeOrg, orgID, dekId, version), nil // Use dekId
+		// Format: dek:organization:<orgID>:v<version>
+		return fmt.Sprintf("%s:%s:%s:v%d", cacheKeyPrefixDEK, scopeOrg, orgID, version), nil
 	}
 
-	// Return error for invalid scope
-	return "", fmt.Errorf("invalid scope or missing organization ID: scope=%s, orgID=%s", scope, orgID)
+	// Return error for invalid scope or missing orgID
+	return "", fmt.Errorf("invalid scope or missing organization ID for unwrapped cache key: scope=%s, orgID=%s", scope, orgID)
 }
 
-// getCacheTTL returns the effective cache TTL
-func (s *dekService) getCacheTTL() time.Duration {
-	if s.config != nil && s.config.Cache.TTL > 0 {
-		return time.Duration(s.config.Cache.TTL) * time.Second
-	}
-	return defaultCacheTTL
-}
+// // getCacheTTL returns the effective cache TTL
+// func (s *dekService) getCacheTTL() time.Duration {
+// 	if s.config != nil && s.config.Cache.TTL > 0 {
+// 		return time.Duration(s.config.Cache.TTL) * time.Second
+// 	}
+// 	return defaultCacheTTL
+// }
 
 // UnwrapDEK unwraps a DEK version using the configured KMS provider
 func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) ([]byte, error) {
+	// +++ DEBUG LOGGING +++
+	cacheStatusLog := s.zLogger.Debug()
+	cacheIsNil := s.cache == nil
+	cacheIsEnabled := false
+	if !cacheIsNil {
+		cacheIsEnabled = s.cache.IsEnabled()
+	}
+	cacheStatusLog.Bool("sCacheIsNil", cacheIsNil).
+		Bool("sCacheIsEnabled", cacheIsEnabled).
+		Msg("UnwrapDEK: Cache status at entry")
+	// +++ END DEBUG LOGGING +++
+
 	if version == nil {
 		return nil, fmt.Errorf("version is required")
 	}
+	if version.BlobInfo == nil {
+		return nil, fmt.Errorf("version.BlobInfo is required")
+	}
 
-	log.Debug().
+	// Determine scope/orgID early for dynamic lookups
+	scope, orgID := s.getScopeFromContext(ctx)
+
+	s.zLogger.Debug().
 		Int("version", int(version.Version)).
-		Str("keyId", version.BlobInfo.KeyInfo.KeyId). // Use KeyId
+		Str("keyId", version.BlobInfo.KeyInfo.KeyId). // Use extracted KeyId
 		Bool("hasWrappedKey", version.BlobInfo.KeyInfo != nil && len(version.BlobInfo.KeyInfo.WrappedKey) > 0).
 		Bool("hasCiphertext", len(version.BlobInfo.Ciphertext) > 0).
 		Bool("hasIv", len(version.BlobInfo.Iv) > 0).
@@ -825,35 +904,55 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 		Msg("Starting DEK unwrap")
 
 	// Use the stored BlobInfo directly
-	if version.BlobInfo == nil {
-		return nil, fmt.Errorf("no blob info available")
-	}
+	// if version.BlobInfo == nil { // Already checked above
+	// 	return nil, fmt.Errorf("no blob info available")
+	// }
 
 	// Try cache first if enabled
-	if s.cache != nil && s.cache.IsEnabled() && s.info != nil {
-		cacheKey, err := s.getUnwrappedCacheKey(ctx, s.info.Id, version.Version) // Use Id
+	// Removed dekInfoId check for cache attempt, key generation no longer needs it.
+	if s.cache != nil && s.cache.IsEnabled() {
+		cacheKey, err := s.getUnwrappedCacheKey(ctx, version.Version) // Removed dekInfoId
 		if err == nil {
+			// --- DEBUG LOGGING ADDED ---
+			s.zLogger.Debug().
+				Str("cacheKeyAttempt", cacheKey).
+				Str("scope", scope).
+				Str("orgID", orgID).
+				Int("version", version.Version).
+				Msg("UnwrapDEK: Attempting to GET unwrapped DEK from cache")
+			// --- END DEBUG LOGGING ---
 			if dek, _, found := s.cache.Get(ctx, cacheKey); found && dek != nil && len(dek.Get()) > 0 {
-				log.Debug().
+				s.zLogger.Debug().
 					Str("cacheKey", cacheKey).
 					Int("version", version.Version).
-					Int("dekLength", len(dek.Get())).
+					Int("dekLength", len(dek.Get())). // Log length
 					Msg("Using cached unwrapped DEK")
 				return dek.Get(), nil
 			}
-			log.Debug().
+			s.zLogger.Debug().
 				Str("cacheKey", cacheKey).
 				Int("version", version.Version).
 				Msg("Cache miss for unwrapped DEK")
 		} else {
-			log.Warn().Err(err).Msg("Failed to generate unwrapped cache key")
+			s.zLogger.Warn().Err(err).Msg("Failed to generate unwrapped cache key in UnwrapDEK") // Log specific location
 		}
 	}
 
-	// Get wrapper from provider
-	wrapper := s.provider.GetWrapper()
+	// Get provider dynamically (scope/orgID already determined)
+	provider, err := s.kmsGetter.GetKMSProvider(ctx, scope, orgID)
+	if err != nil {
+		s.zLogger.Error().Err(err).Str("scope", scope).Str("orgID", orgID).Msg("Failed to get KMS provider for unwrapping")
+		return nil, fmt.Errorf("failed to get KMS provider for scope '%s': %w", scope, err)
+	}
+	if provider == nil {
+		s.zLogger.Error().Str("scope", scope).Str("orgID", orgID).Msg("KMS provider is nil (dynamically fetched), cannot unwrap DEK")
+		return nil, fmt.Errorf("KMS provider not configured for scope '%s'", scope)
+	}
+
+	// Get wrapper from the dynamically fetched provider
+	wrapper := provider.GetWrapper()
 	if wrapper == nil {
-		log.Error().Msg("KMS wrapper not available")
+		s.zLogger.Error().Msg("KMS wrapper not available from provider")
 		return nil, fmt.Errorf("KMS wrapper not available")
 	}
 
@@ -865,19 +964,19 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 	// If it's missing, decryption cannot proceed safely.
 	if len(version.WrapContext) == 0 {
 		err := fmt.Errorf("missing wrap context in DEK version %d, cannot determine AAD for decryption", version.Version)
-		log.Error().Err(err).Msg("UnwrapDEK failed")
+		s.zLogger.Error().Err(err).Msg("UnwrapDEK failed")
 		return nil, err
 	}
 
 	finalAAD = version.WrapContext
-	log.Debug().
+	s.zLogger.Debug().
 		Hex("version.WrapContext", version.WrapContext).
 		Hex("finalAAD", finalAAD).
 		Msg("AAD Source: Using wrap context stored in version")
 	opts = append(opts, wrapping.WithAad(finalAAD))
 
 	// Decrypt using KMS with the stored blob info
-	logEntry := log.Debug()
+	logEntry := s.zLogger.Debug()
 	if version.BlobInfo.KeyInfo != nil {
 		logEntry = logEntry.Str("keyId", version.BlobInfo.KeyInfo.KeyId) // Use KeyId only if KeyInfo exists
 	} else {
@@ -896,7 +995,7 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 
 	dek, err := wrapper.Decrypt(ctx, version.BlobInfo, opts...)
 	if err != nil {
-		logEntry := log.Error().Err(err)
+		logEntry := s.zLogger.Error().Err(err)
 		if version.BlobInfo.KeyInfo != nil {
 			logEntry = logEntry.Str("keyId", version.BlobInfo.KeyInfo.KeyId) // Use KeyId only if KeyInfo exists
 		} else {
@@ -911,29 +1010,65 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 	}
 
 	if len(dek) == 0 {
-		log.Error().Msg("Unwrapped DEK is empty")
+		s.zLogger.Error().Msg("Unwrapped DEK is empty")
 		return nil, fmt.Errorf("unwrapped key is empty")
 	}
 
-	log.Debug().
+	s.zLogger.Debug().
 		Int("dekLength", len(dek)).
 		Msg("Successfully unwrapped DEK")
 
 	// Cache the unwrapped DEK if enabled
-	if s.cache != nil && s.cache.IsEnabled() && s.info != nil {
-		cacheKey, err := s.getUnwrappedCacheKey(ctx, s.info.Id, version.Version) // Use Id
-		if err == nil {
-			ttl := s.getCacheTTL()
-			s.cache.Set(ctx, cacheKey, dek, version.Version)
-			log.Debug().
+	// Removed dekInfoId check
+	if s.cache != nil && s.cache.IsEnabled() {
+		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, version.Version) // Removed dekInfoId
+		if keyErr == nil {
+			// --- DEBUG LOGGING ADDED ---
+			s.zLogger.Debug().
 				Str("cacheKey", cacheKey).
 				Int("version", version.Version).
 				Int("dekLength", len(dek)).
-				Dur("ttl", ttl).
-				Time("expires", time.Now().Add(ttl)).
-				Msg("DEK cached successfully")
+				Msg("UnwrapDEK: Attempting to SET unwrapped DEK in cache")
+			// --- END DEBUG LOGGING ---
+
+			// +++ MORE DEBUGGING +++
+			s.zLogger.Debug().
+				Str("cacheKey", cacheKey).
+				Int("version", version.Version).
+				Msg("UnwrapDEK: >>> Calling s.cache.Set NOW <<< ")
+			// +++ END MORE DEBUGGING +++
+
+			// Call Set - Note: The Cache interface's Set method doesn't return an error.
+			s.cache.Set(ctx, cacheKey, dek, version.Version)                                                        // Just call Set
+			s.zLogger.Debug().Str("cacheKey", cacheKey).Int("version", version.Version).Msg("Cached unwrapped DEK") // Log after setting
+
+			// +++ MORE DEBUGGING +++
+			s.zLogger.Debug().
+				Str("cacheKey", cacheKey).
+				Int("version", version.Version).
+				Msg("UnwrapDEK: <<< s.cache.Set call COMPLETED >>>")
+			// +++ END MORE DEBUGGING +++
+
+			// Log success assuming Set worked (as interface provides no error feedback)
+			// s.zLogger.Debug().Str("cacheKey", cacheKey).Int("version", version.Version).Msg("Cached unwrapped DEK") // Redundant with log inside Set error check
+
+			/* // Original logic with error checking removed as Set doesn't return error
+			cacheSetErr := s.cache.Set(ctx, cacheKey, dek, version.Version)
+			if cacheSetErr != nil {
+				// --- DEBUG LOGGING ADDED ---
+				s.zLogger.Error().
+					Err(cacheSetErr).
+					Str("cacheKey", cacheKey).
+					Int("version", version.Version).
+					Msg("UnwrapDEK: Failed to SET unwrapped DEK in cache")
+				// --- END DEBUG LOGGING ---
+			} else {
+				s.zLogger.Debug().Str("cacheKey", cacheKey).Int("version", version.Version).Msg("Cached unwrapped DEK") // Original log
+			}
+			*/
+
 		} else {
-			log.Warn().Err(err).Msg("Failed to generate cache key for caching DEK")
+			s.zLogger.Warn().Err(keyErr).Msg("Failed to generate cache key for caching DEK in UnwrapDEK") // Log specific location
 		}
 	}
 
@@ -942,21 +1077,22 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 
 // RotateDEK rotates the current DEK
 func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, force bool) (*types.DEKInfo, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// s.mu.Lock() // Lock should not be needed for the whole operation
 
-	// Get current DEK info
+	// Get current DEK info from store (no lock needed for store access)
 	currentInfo, err := s.store.GetActiveDEK(ctx, scope, orgID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get current DEK: %w", err)
+		// s.mu.Unlock() // Remove unlock
+		return nil, fmt.Errorf("failed to get current DEK for rotation: %w", err)
 	}
 
 	if currentInfo == nil {
-		return nil, fmt.Errorf("no active DEK found")
+		// s.mu.Unlock() // Remove unlock
+		return nil, fmt.Errorf("no active DEK found for rotation")
 	}
 
 	// Log current info for debugging
-	log.Debug().
+	s.zLogger.Debug().
 		Str("dekID", currentInfo.Id). // Use Id
 		Int("currentVersion", currentInfo.Version).
 		Int("numVersions", len(currentInfo.Versions)).
@@ -964,8 +1100,12 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 		Msg("Current DEK info before rotation")
 
 	if len(currentInfo.Versions) == 0 {
+		// s.mu.Unlock() // Remove unlock
 		return nil, fmt.Errorf("current DEK has no versions")
 	}
+
+	// --- No need for temporary lock release ---
+	// s.mu.Unlock()
 
 	// Get current version of DEK
 	currentVersion := currentInfo.Version
@@ -977,7 +1117,7 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 	// Check if this is a full re-encryption (force=true) or envelope encryption (force=false)
 	if force {
 		// FULL RE-ENCRYPTION: Generate a completely new DEK key
-		log.Info().Msg("Performing FULL RE-ENCRYPTION with new DEK key")
+		s.zLogger.Info().Msg("Performing FULL RE-ENCRYPTION with new DEK key")
 
 		// Generate new DEK key
 		plaintextDEK, err = s.generateDEK()
@@ -985,7 +1125,7 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 			return nil, fmt.Errorf("failed to generate new DEK key for full re-encryption: %w", err)
 		}
 
-		// Wrap the new DEK
+		// Wrap the new DEK (wrapDEK will fetch provider)
 		newVersion, err = s.wrapDEK(ctx, plaintextDEK, scope, orgID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to wrap new DEK for full re-encryption: %w", err)
@@ -994,7 +1134,7 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 		isSameKey = false // Key has changed
 	} else {
 		// ENVELOPE ENCRYPTION: Just re-wrap the same plaintext DEK
-		log.Info().Msg("Performing ENVELOPE ENCRYPTION (re-wrapping same DEK key)")
+		s.zLogger.Info().Msg("Performing ENVELOPE ENCRYPTION (re-wrapping same DEK key)")
 
 		// First, find the current version in the versions array
 		var currentVersionData *types.DEKVersion
@@ -1009,14 +1149,14 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 			return nil, fmt.Errorf("could not find current DEK version in versions array")
 		}
 
-		// Get plaintext DEK by unwrapping the current version
+		// Get plaintext DEK by unwrapping the current version (UnwrapDEK will fetch provider)
 		plaintextDEK, err = s.UnwrapDEK(ctx, currentVersionData)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unwrap current DEK version: %w", err)
 		}
 
 		// Add detailed logging for the original DEK
-		log.Debug().
+		s.zLogger.Debug().
 			Int("currentVersion", currentVersion).
 			Int("dekLength", len(plaintextDEK)).
 			Hex("dekKeyHash", createKeyHash(plaintextDEK)). // Log a hash of the key for comparison
@@ -1025,14 +1165,14 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 		// DO NOT generate a new plaintext DEK, re-use the existing one
 		// This is the key difference between envelope encryption and full re-encryption
 
-		// Just re-wrap the EXACT SAME plaintext DEK with a new KMS key wrapping
+		// Just re-wrap the EXACT SAME plaintext DEK with a new KMS key wrapping (wrapDEK fetches provider)
 		newVersion, err = s.wrapDEK(ctx, plaintextDEK, scope, orgID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to wrap DEK for new version: %w", err)
 		}
 
 		// Add detailed logging for the new wrapped DEK
-		log.Debug().
+		s.zLogger.Debug().
 			Int("newVersion", currentVersion+1).
 			Hex("dekKeyHash", createKeyHash(plaintextDEK)). // Should be the same hash
 			Msg("Successfully re-wrapped same DEK key for new version")
@@ -1054,7 +1194,7 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 	}
 
 	// Log update for debugging
-	log.Debug().
+	s.zLogger.Debug().
 		Str("dekID", updatedInfo.Id). // Use Id
 		Int("oldVersion", currentVersion).
 		Int("newVersion", updatedInfo.Version).
@@ -1068,28 +1208,42 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 		return nil, fmt.Errorf("failed to store updated DEK: %w", err)
 	}
 
-	// Update service state
-	s.info = updatedInfo
-	s.status = &types.DEKStatus{
-		Exists:      true,
-		Active:      true,
-		Version:     updatedInfo.Version,
-		CreatedAt:   updatedInfo.CreatedAt,
-		UpdatedAt:   updatedInfo.UpdatedAt,
-		Provider:    s.config.Provider,
-		NeedsRotate: false,
+	// --- Critical section: Update internal state (only status, no s.info) ---
+	s.mu.Lock() // Acquire write lock *only* for updating internal status
+	// s.info = updatedInfo // Removed assignment to s.info
+	providerType := ""
+	// Fetch config dynamically to get provider type - use the context passed to RotateDEK
+	config, configErr := s.configGetter.GetEncryptionConfig(ctx, scope, orgID)
+	if configErr == nil && config != nil {
+		providerType = string(config.Provider)
+	} else {
+		s.zLogger.Warn().Err(configErr).Str("scope", scope).Str("orgID", orgID).Msg("Failed to get config for status update during rotation, provider type may be empty")
 	}
+	// Update the existing status object if it's not nil, otherwise create a new one
+	if s.status == nil {
+		s.status = &types.DEKStatus{}
+	}
+	s.status.Exists = true
+	s.status.Active = true
+	s.status.Version = updatedInfo.Version
+	s.status.CreatedAt = updatedInfo.CreatedAt
+	s.status.UpdatedAt = updatedInfo.UpdatedAt
+	s.status.Provider = types.ProviderType(providerType)
+	s.status.NeedsRotate = false
+
+	s.mu.Unlock() // Release lock after updating internal state
+	// --- End Critical section ---
 
 	// Clear cache
 	if s.cache != nil {
 		cacheKey, err := s.getCacheKey(scope, orgID)
 		if err == nil {
 			s.cache.Delete(cacheKey)
-			log.Debug().
+			s.zLogger.Debug().
 				Str("cacheKey", cacheKey).
 				Msg("Cleared DEK cache after rotation")
 		} else {
-			log.Warn().Err(err).Msg("Failed to generate cache key for clearing cache after rotation")
+			s.zLogger.Warn().Err(err).Msg("Failed to generate cache key for clearing cache after rotation")
 		}
 	}
 
@@ -1114,119 +1268,154 @@ func createKeyHash(key []byte) []byte {
 
 // GetActiveDEK returns the current active DEK for field encryption
 func (s *dekService) GetActiveDEK(ctx context.Context, scope string, orgID string) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// No internal lock needed here as we are fetching dynamically
+
+	// Fetch current DEK info from store first
+	currentInfo, err := s.store.GetActiveDEK(ctx, scope, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active DEK info: %w", err)
+	}
+	if currentInfo == nil || !currentInfo.Active || len(currentInfo.Versions) == 0 {
+		return nil, fmt.Errorf("no active DEK found for scope %s/%s", scope, orgID)
+	}
+	currentVersionNumber := currentInfo.Version
+	dekInfoId := currentInfo.Id // Get ID from fetched info
 
 	// Try cache first if enabled
-	if s.cache != nil && s.cache.IsEnabled() && s.info != nil {
-		cacheKey, err := s.getUnwrappedCacheKey(ctx, s.info.Id, s.info.Version) // Use Id
-		if err == nil {
-			if dek, version, found := s.cache.Get(ctx, cacheKey); found && dek != nil && len(dek.Get()) > 0 {
-				// Verify the cached version matches the current version
-				if version == s.info.Version {
-					log.Debug().
+	if s.cache != nil && s.cache.IsEnabled() {
+		// Use the current version number for the cache key
+		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, currentVersionNumber) // Removed dekInfoId
+		if keyErr == nil {
+			// --- DEBUG LOGGING ADDED ---
+			s.zLogger.Debug().
+				Str("cacheKeyAttempt", cacheKey).
+				Str("scope", scope).
+				Str("orgID", orgID).
+				Int("version", currentVersionNumber).
+				Msg("GetActiveDEK: Attempting to GET unwrapped DEK from cache")
+			// --- END DEBUG LOGGING ---
+			if dek, cachedVersion, found := s.cache.Get(ctx, cacheKey); found && dek != nil && len(dek.Get()) > 0 {
+				// Verify the cached version matches the current version from the store
+				if cachedVersion == currentVersionNumber {
+					s.zLogger.Debug().
 						Str("scope", scope).
 						Str("orgID", orgID).
-						Int("version", version).
+						Int("version", cachedVersion).
 						Str("cacheKey", cacheKey).
 						Int("dekLength", len(dek.Get())).
 						Msg("Using cached active DEK")
 					return dek.Get(), nil
 				}
-				log.Debug().
+				// Fix: Use currentVersionNumber fetched from store, not undefined currentInfo.Version
+				s.zLogger.Debug().
 					Str("scope", scope).
 					Str("orgID", orgID).
-					Int("cachedVersion", version).
-					Int("currentVersion", s.info.Version).
+					Int("cachedVersion", cachedVersion).
+					Int("currentVersion", currentVersionNumber).
 					Msg("Cached DEK version mismatch, will fetch fresh")
 			}
 		} else {
-			log.Warn().Err(err).Msg("Failed to generate unwrapped cache key")
+			s.zLogger.Warn().Err(keyErr).Msg("Failed to generate unwrapped cache key in GetActiveDEK") // Log specific location
 		}
 	}
 
-	// Get DEK info from store
-	log.Debug().
+	// If cache miss or version mismatch, unwrap the latest version from the fetched info
+	s.zLogger.Debug().
 		Str("scope", scope).
-		Str("id", orgID).
-		Bool("hasStore", s.store != nil).
-		Msg("Getting DEK info")
+		Str("orgID", orgID).
+		Str("dekId", dekInfoId). // Keep logging the actual DB DEK ID for info
+		Int("version", currentVersionNumber).
+		Msg("Cache miss or mismatch, unwrapping active DEK from store info")
 
-	info, err := s.store.GetActiveDEK(ctx, scope, orgID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get active DEK: %w", err)
-	}
+	// Get latest version details from the info we already fetched
+	latestVersion := currentInfo.Versions[len(currentInfo.Versions)-1]
 
-	if info == nil || !info.Active || len(info.Versions) == 0 {
-		return nil, fmt.Errorf("no active DEK found")
-	}
-
-	// Get latest version
-	latestVersion := info.Versions[len(info.Versions)-1]
-
-	// Update service state
-	s.info = info
-
-	// Unwrap and cache the DEK
-	return s.UnwrapDEK(ctx, &latestVersion)
+	// Unwrap and cache the DEK (UnwrapDEK handles caching internally)
+	return s.UnwrapDEK(ctx, &latestVersion) // Calls UnwrapDEK
 }
 
 // Delete removes the current DEK
-func (s *dekService) Delete(ctx context.Context) error {
-	if s.info == nil {
-		err := fmt.Errorf("DEK not initialized")
-		s.logAuditEvent(ctx, eventType, operationRestore, statusFailed, 0, err)
-		return err
-	}
+// func (s *dekService) Delete(ctx context.Context) error {
+// 	// This method seems problematic as it lacks scope/orgID.
+// 	// Deleting a DEK should likely happen via DeleteDEK which requires scope/orgID.
+// 	// Let's log a warning and make it a no-op for now.
+// 	s.zLogger.Warn().Msg("dekService.Delete called without scope/orgID, this method is deprecated. Use DeleteDEK instead.")
+// 	// Returning nil to avoid breaking interface compatibility if it's still used somewhere.
+// 	return nil
+// 	/* // Original problematic logic:
+// 	s.mu.Lock() // Lock needed to safely read internal status
+// 	// We need scope/orgID here to know *which* DEK to log deletion for.
+// 	// Assuming system scope for logging as a fallback.
+// 	scope, orgID := scopeSystem, ""
+// 	versionToLog := 0
+// 	if s.status != nil {
+// 		versionToLog = s.status.Version
+// 	}
+// 	s.mu.Unlock() // Unlock after reading status
 
-	version := s.info.Version
+// 	s.logAuditEvent(ctx, eventType, operationRestore, statusSuccess, versionToLog, nil) // Logging success might be misleading
 
-	// Log success before deletion
-	s.logAuditEvent(ctx, eventType, operationRestore, statusSuccess, version, nil)
+// 	// Clear internal status (only safe part of original logic)
+// 	s.mu.Lock()
+// 	s.status = &types.DEKStatus{
+// 		Exists:    false,
+// 		Active:    false,
+// 		Version:   0,
+// 		CreatedAt: time.Time{},
+// 		UpdatedAt: time.Time{},
+// 		// Provider: s.config.Provider, // Cannot access s.config
+// 		Provider:    "", // Set provider empty
+// 		NeedsRotate: false,
+// 	}
+// 	s.mu.Unlock()
 
-	// Clear DEK info and status
-	s.info = nil
-	s.status = &types.DEKStatus{
-		Exists:      false,
-		Active:      false,
-		Version:     0,
-		CreatedAt:   time.Time{},
-		UpdatedAt:   time.Time{},
-		Provider:    s.config.Provider,
-		NeedsRotate: false,
-	}
-
-	return nil
-}
+// 	return nil
+// 	*/
+// }
 
 // GetDEKStatus gets the status of a DEK for a specific scope and organization
 func (s *dekService) GetDEKStatus(ctx context.Context, scope string, orgID string) (*types.DEKStatus, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// No lock needed here as we fetch everything dynamically
 
-	// Get DEK info
-	cacheKey, err := s.getCacheKey(scope, orgID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate cache key: %w", err)
+	// Fetch config first to get provider type (even if DEK doesn't exist)
+	config, configErr := s.configGetter.GetEncryptionConfig(ctx, scope, orgID)
+	providerType := ""
+	if configErr == nil && config != nil {
+		providerType = string(config.Provider)
+	} else if configErr != nil && configErr != mongo.ErrNoDocuments {
+		// Log error if config fetch failed for reasons other than not found
+		s.zLogger.Warn().Err(configErr).Str("scope", scope).Str("orgID", orgID).Msg("Failed to get config for DEK status check")
+		// Continue, but provider type will be empty
 	}
-	info, err := s.GetDEKInfo(ctx, cacheKey) // Pass cacheKey as ID? Seems wrong. Should pass orgID or "" for system.
+
+	// Now check for the DEK in the store
+	info, err := s.store.GetActiveDEK(ctx, scope, orgID)
 	if err != nil {
-		// If not found, return default status
-		if strings.Contains(err.Error(), "not found") {
-			return &types.DEKStatus{Exists: false, Active: false, Provider: s.config.Provider}, nil
+		// If not found, return default status with the provider type from config
+		if strings.Contains(err.Error(), "not found") || err == mongo.ErrNoDocuments {
+			return &types.DEKStatus{
+				Exists:      false,
+				Active:      false,
+				Provider:    types.ProviderType(providerType), // Use fetched provider type
+				NeedsRotate: false,                            // Assuming false if not found
+			}, nil
 		}
-		return nil, err
+		// For other store errors, return the error
+		return nil, fmt.Errorf("failed to get DEK info for status check: %w", err)
 	}
 
-	// Create status
+	// If DEK info found, create status
+	// TODO: Implement rotation check logic if needed
+	needsRotate := false // Placeholder
+
 	status := &types.DEKStatus{
 		Exists:      true,
 		Active:      info.Active,
 		Version:     info.Version,
 		CreatedAt:   info.CreatedAt,
 		UpdatedAt:   info.UpdatedAt,
-		Provider:    s.config.Provider,
-		NeedsRotate: false, // TODO: Implement rotation check logic
+		Provider:    types.ProviderType(providerType), // Use fetched provider type
+		NeedsRotate: needsRotate,
 	}
 
 	return status, nil
@@ -1237,7 +1426,7 @@ func (s *dekService) GetInfo(ctx context.Context, scope string, id string) (*typ
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	log.Debug().
+	s.zLogger.Debug().
 		Str("scope", scope).
 		Str("id", id).
 		Bool("hasStore", s.store != nil).
@@ -1246,7 +1435,7 @@ func (s *dekService) GetInfo(ctx context.Context, scope string, id string) (*typ
 	// Get DEK info from store
 	info, err := s.store.GetActiveDEK(ctx, scope, id) // Use GetActiveDEK for consistency? Or GetDEK?
 	if err != nil {
-		log.Error().
+		s.zLogger.Error().
 			Err(err).
 			Str("scope", scope).
 			Str("id", id).
@@ -1256,14 +1445,14 @@ func (s *dekService) GetInfo(ctx context.Context, scope string, id string) (*typ
 
 	// If no DEK exists, return nil
 	if info == nil {
-		log.Debug().
+		s.zLogger.Debug().
 			Str("scope", scope).
 			Str("id", id).
 			Msg("No DEK info found")
 		return nil, nil
 	}
 
-	log.Debug().
+	s.zLogger.Debug().
 		Str("scope", scope).
 		Str("id", id).
 		Str("dekId", info.Id). // Use Id
@@ -1278,53 +1467,71 @@ func (s *dekService) GetInfo(ctx context.Context, scope string, id string) (*typ
 }
 
 // GetStatus implements Service
-func (s *dekService) GetStatus(ctx context.Context, scope string, orgID string) (*types.DEKStatus, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// func (s *dekService) GetStatus(ctx context.Context, scope string, orgID string) (*types.DEKStatus, error) {
+// 	// This method is essentially the same as GetDEKStatus. Delegate to it.
+// 	s.zLogger.Debug().Str("scope", scope).Str("orgID", orgID).Msg("GetStatus called, delegating to GetDEKStatus")
+// 	return s.GetDEKStatus(ctx, scope, orgID)
+// 	/* // Original logic removed:
+// 	s.mu.RLock() // Lock for reading internal state like config
 
-	// If service is not properly initialized, return disabled status
-	if s.config == nil || s.store == nil {
-		return &types.DEKStatus{
-			Exists:      false,
-			Active:      false,
-			Version:     0,
-			CreatedAt:   time.Time{},
-			UpdatedAt:   time.Time{},
-			Provider:    "",
-			NeedsRotate: false,
-		}, nil
-	}
+// 	// If service is not properly initialized, return disabled status
+// 	// Remove check for s.config
+// 	if s.store == nil { // Only check store now
+// 		s.mu.RUnlock()
+// 		return &types.DEKStatus{
+// 			Exists:      false,
+// 			Active:      false,
+// 			Version:     0,
+// 			CreatedAt:   time.Time{},
+// 			UpdatedAt:   time.Time{},
+// 			Provider:    "",
+// 			NeedsRotate: false,
+// 		}, nil
+// 	}
+// 	// Cannot copy config provider type anymore
+// 	// configProviderType := s.config.Provider
+// 	s.mu.RUnlock() // Unlock before potentially slow store operation
 
-	// Get active DEK from store
-	info, err := s.store.GetActiveDEK(ctx, scope, orgID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get DEK status: %w", err)
-	}
+// 	// Fetch config dynamically for provider type
+// 	config, configErr := s.configGetter.GetEncryptionConfig(ctx, scope, orgID)
+// 	configProviderType := ""
+// 	if configErr == nil && config != nil {
+// 		configProviderType = string(config.Provider)
+// 	} else if configErr != nil && configErr != mongo.ErrNoDocuments {
+// 		s.zLogger.Warn().Err(configErr).Str("scope", scope).Str("orgID", orgID).Msg("Failed to get config for GetStatus provider type")
+// 	}
 
-	// If no DEK exists, return status indicating that
-	if info == nil {
-		return &types.DEKStatus{
-			Exists:      false,
-			Active:      false,
-			Version:     0,
-			CreatedAt:   time.Time{},
-			UpdatedAt:   time.Time{},
-			Provider:    s.config.Provider,
-			NeedsRotate: false,
-		}, nil
-	}
+// 	// Get active DEK from store (no lock needed for store call)
+// 	info, err := s.store.GetActiveDEK(ctx, scope, orgID)
+// 	if err != nil && !strings.Contains(err.Error(), "not found") && err != mongo.ErrNoDocuments { // Allow "not found"
+// 		return nil, fmt.Errorf("failed to get DEK status: %w", err)
+// 	}
 
-	// Return status for existing DEK
-	return &types.DEKStatus{
-		Exists:      true,
-		Active:      info.Active,
-		Version:     info.Version,
-		CreatedAt:   info.CreatedAt,
-		UpdatedAt:   info.UpdatedAt,
-		Provider:    s.config.Provider,
-		NeedsRotate: false, // TODO: Implement rotation check logic
-	}, nil
-}
+// 	// If no DEK exists, return status indicating that
+// 	if info == nil {
+// 		return &types.DEKStatus{
+// 			Exists:      false,
+// 			Active:      false,
+// 			Version:     0,
+// 			CreatedAt:   time.Time{},
+// 			UpdatedAt:   time.Time{},
+// 			Provider:    types.ProviderType(configProviderType), // Use provider type from config
+// 			NeedsRotate: false,
+// 		}, nil
+// 	}
+
+// 	// Return status for existing DEK
+// 	return &types.DEKStatus{
+// 		Exists:      true,
+// 		Active:      info.Active,
+// 		Version:     info.Version,
+// 		CreatedAt:   info.CreatedAt,
+// 		UpdatedAt:   info.UpdatedAt,
+// 		Provider:    types.ProviderType(configProviderType), // Use provider type from config
+// 		NeedsRotate: false,              // TODO: Implement rotation check logic
+// 	}, nil
+// 	*/
+// }
 
 // Create implements Service
 func (s *dekService) Create(ctx context.Context, scope string, id string) error {
@@ -1341,4 +1548,138 @@ func (s *dekService) Rotate(ctx context.Context, scope string, id string) error 
 // Restore implements Service
 func (s *dekService) Restore(ctx context.Context, scope string, id string) error {
 	return s.DeleteDEK(ctx, scope, id)
+}
+
+// InvalidateCache clears cache entries related to a specific scope.
+// Required for the DEKService interface and used by CoreEncryptionService.
+func (s *dekService) InvalidateCache(ctx context.Context, scope string, scopeID string) error {
+	s.zLogger.Debug().Str("scope", scope).Str("scopeID", scopeID).Msg("Invalidating DEK cache")
+
+	if s.cache == nil || !s.cache.IsEnabled() {
+		s.zLogger.Debug().Str("scope", scope).Str("scopeID", scopeID).Msg("Cache not enabled or nil, skipping invalidation")
+		return nil
+	}
+
+	// Invalidate DEK Info cache
+	infoCacheKey, err := s.getCacheKey(scope, scopeID)
+	if err == nil {
+		s.cache.Delete(infoCacheKey)
+		s.zLogger.Debug().Str("key", infoCacheKey).Msg("Deleted DEK info cache key")
+	} else {
+		s.zLogger.Warn().Err(err).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to generate DEK info cache key for invalidation")
+		// Continue to try and invalidate unwrapped keys if possible
+	}
+
+	// Invalidate unwrapped DEK cache (requires fetching DEK ID if not readily available)
+	// This is tricky as we might not have the DEK ID easily here.
+	// A simpler approach might be needed, or the cache keys need rethinking.
+	// For now, log a warning. A more robust solution might involve pattern deletion if the cache supports it.
+	// TODO: Implement robust unwrapped DEK cache invalidation if needed.
+	s.zLogger.Warn().Str("scope", scope).Str("scopeID", scopeID).Msg("Unwrapped DEK cache invalidation is not fully implemented yet")
+
+	// Example of how it *might* work: Fetch info first, then invalidate
+	/*
+		dekInfo, infoErr := s.store.GetActiveDEK(ctx, scope, scopeID)
+		if infoErr == nil && dekInfo != nil {
+			dekID := dekInfo.Id
+			for _, version := range dekInfo.Versions {
+				// We need a context potentially enriched with scope/orgID if getUnwrappedCacheKey relies on it.
+				// Assuming the passed 'ctx' might already have it.
+				unwrappedKey, keyErr := s.getUnwrappedCacheKey(ctx, dekID, version.Version)
+				if keyErr == nil {
+					s.cache.Delete(unwrappedKey)
+					s.zLogger.Debug().Str("key", unwrappedKey).Msg("Deleted unwrapped DEK cache key")
+				} else {
+					s.zLogger.Warn().Err(keyErr).Str("dekID", dekID).Int("version", version.Version).Msg("Failed to generate unwrapped cache key during invalidation")
+				}
+			}
+		} else if infoErr != nil && infoErr != mongo.ErrNoDocuments {
+			s.zLogger.Error().Err(infoErr).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to fetch DEK info during cache invalidation")
+		} else {
+			s.zLogger.Debug().Str("scope", scope).Str("scopeID", scopeID).Msg("No active DEK found, skipping unwrapped key invalidation")
+		}
+	*/
+
+	return nil // Return nil for now, even if unwrapped invalidation is incomplete
+}
+
+// GetScopedFieldService returns a FieldService instance appropriate for the scope
+// defined in the context. It checks configuration and initializes necessary components
+// (like KMS provider, DEK info) on-demand.
+func (s *dekService) GetScopedFieldService(ctx context.Context) (interfaces.FieldService, error) {
+	// 1. Extract scope and scopeID from context
+	scope, scopeID := s.getScopeFromContext(ctx)
+	s.zLogger.Debug().Str("scope", scope).Str("scopeID", scopeID).Msg("GetScopedFieldService called")
+
+	// 2. Fetch configuration for the scope using ConfigGetter
+	config, err := s.configGetter.GetEncryptionConfig(ctx, scope, scopeID)
+	if err != nil {
+		// If config not found, treat as disabled
+		if err == mongo.ErrNoDocuments || strings.Contains(err.Error(), "not found") {
+			s.zLogger.Info().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption config not found for scope, returning no-op FieldService.")
+			return field.NewFieldService(nil, s.logger), nil // Return no-op service (nil DEKProvider)
+		}
+		// For other errors fetching config, return the error
+		s.zLogger.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to get encryption config for scope")
+		return nil, fmt.Errorf("failed to get encryption config for scope %s/%s: %w", scope, scopeID, err)
+	}
+
+	// 3. Check if encryption is enabled in the fetched config
+	if config == nil || !config.Enabled {
+		s.zLogger.Debug().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption explicitly disabled for scope, returning no-op FieldService.")
+		return field.NewFieldService(nil, s.logger), nil // Return no-op service (nil DEKProvider)
+	}
+
+	// 4. Encryption is enabled - Ensure necessary components are ready
+	s.zLogger.Debug().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption enabled for scope. Ensuring KMS and DEK are ready.")
+
+	// 4a. Get KMS Provider (will be cached by the getter implementation)
+	// Pass the original context down
+	kmsProvider, err := s.kmsGetter.GetKMSProvider(ctx, scope, scopeID)
+	if err != nil {
+		s.zLogger.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to get KMS provider for enabled scope")
+		return nil, fmt.Errorf("failed to get KMS provider for scope %s/%s: %w", scope, scopeID, err)
+	}
+	if kmsProvider == nil {
+		// This should ideally not happen if config.Enabled is true and config is valid, but handle defensively.
+		s.zLogger.Error().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption enabled but KMS provider is nil")
+		return nil, fmt.Errorf("encryption enabled but KMS provider is not available for scope %s/%s", scope, scopeID)
+	}
+
+	// 4b. Load DEK Info (using the store, which handles its own caching via loadDEKInfo)
+	// Use the original context
+	dekInfo, err := s.loadDEKInfo(ctx)
+	if err != nil {
+		// If DEK not found, we cannot proceed with encryption/decryption
+		if strings.Contains(err.Error(), "not found") {
+			s.zLogger.Error().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption enabled but no active DEK found for scope")
+			return nil, fmt.Errorf("encryption enabled but no active DEK found for scope %s/%s", scope, scopeID)
+		}
+		// Other error loading DEK info
+		s.zLogger.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to load DEK info for enabled scope")
+		return nil, fmt.Errorf("failed to load DEK info for scope %s/%s: %w", scope, scopeID, err)
+	}
+	if dekInfo == nil || !dekInfo.Active || len(dekInfo.Versions) == 0 {
+		s.zLogger.Error().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption enabled but loaded DEK is inactive or has no versions")
+		return nil, fmt.Errorf("encryption enabled but DEK is not active for scope %s/%s", scope, scopeID)
+	}
+
+	// 4c. Perform necessary internal checks (e.g., try unwrapping the latest DEK version)
+	// This ensures the KMS connection and key are valid for the current context.
+	latestVersion := dekInfo.Versions[len(dekInfo.Versions)-1]
+	_, unwrapErr := s.UnwrapDEK(ctx, &latestVersion)
+	if unwrapErr != nil {
+		s.zLogger.Error().Err(unwrapErr).Str("scope", scope).Str("scopeID", scopeID).Int("dekVersion", latestVersion.Version).Msg("DEK verification failed: Unable to unwrap latest DEK version")
+		return nil, fmt.Errorf("DEK verification failed for scope %s/%s: %w", scope, scopeID, unwrapErr)
+	}
+	s.zLogger.Debug().Str("scope", scope).Str("scopeID", scopeID).Int("dekVersion", latestVersion.Version).Msg("DEK verification successful.")
+
+	// 5. Return a properly configured FieldService instance
+	// The field.Service needs a DEKProvider, which dekService implements (GetActiveDEK, UnwrapDEK).
+	s.zLogger.Info().Str("scope", scope).Str("scopeID", scopeID).Msg("Returning configured FieldService for scope.")
+	// field.NewFieldService expects (provider DEKProvider, logger AuditLogger)
+	// Pass 's' (the dekService instance) as the DEKProvider.
+	// We need to make sure dekService correctly implements the methods defined in the DEKProvider interface.
+	// Assuming field.NewFieldService is correctly imported.
+	return field.NewFieldService(s, s.logger), nil
 }

@@ -276,7 +276,7 @@ func (c *DEKCache) testCacheOperation() bool {
 	}, 5*time.Second)
 
 	if err != nil {
-		log.Debug().Err(err).Msg("Cache test operation failed")
+		c.logger.Debug().Err(err).Msg("Cache test operation failed")
 		return false
 	}
 
@@ -299,7 +299,7 @@ func (c *DEKCache) tripCircuitBreaker() {
 	c.breakerResetTime = time.Now()
 	atomic.StoreInt32(&c.consecutiveErrors, 0)
 
-	log.Warn().
+	c.logger.Warn().
 		Time("reset_time", c.breakerResetTime).
 		Dur("half_open_after", breakerHalfOpen).
 		Dur("full_reset_after", breakerResetTimeout).
@@ -318,7 +318,7 @@ func (c *DEKCache) resetCircuitBreaker() {
 	c.breakerTripped = false
 	atomic.StoreInt32(&c.consecutiveErrors, 0)
 
-	log.Info().
+	c.logger.Info().
 		Time("last_tripped", c.breakerResetTime).
 		Msg("Circuit breaker reset")
 }
@@ -367,22 +367,43 @@ func (c *DEKCache) Get(ctx context.Context, key string) (*types.SecureBytes, int
 	default:
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	// --- Request Cache Check ---
+	c.requestCacheMu.RLock()
+
+	reqEntry, reqFound := c.requestCache[key] // Perform the check under the same lock
+	// log.Debug().Str("key", key).Bool("found", reqFound).Msg("DEKCache.Get: Request cache lookup result") // DIAGNOSTIC LOG REMOVED
+	// Check only if found. Expiry is handled by the cleanup routine.
+	if reqFound {
+		// Found in request cache
+		c.requestCacheMu.RUnlock() // Release read lock before returning
+		c.stats.Hits++             // Count as a hit
+		c.stats.LastAccess = time.Now().UTC()
+		c.logger.Trace().Str("key", key).Msg("Request cache hit") // Reverted to Trace level
+		c.recordSuccess()                                         // Record success for circuit breaker
+		c.totalLatency += time.Since(start)
+		return reqEntry.Value, reqEntry.Version, true
+	}
+	c.requestCacheMu.RUnlock() // Release read lock if missed or expired
+	// --- End Request Cache Check ---
+
+	// If not found in request cache, check persistent store
+	c.mu.RLock() // Lock for persistent store access
 
 	var entry types.CacheEntry
 	err := c.store.Get(ctx, key, &entry)
 	if err != nil {
+		c.mu.RUnlock() // Unlock persistent store mutex on error
 		c.stats.Misses++
 		c.stats.LastAccess = time.Now().UTC()
-		// Only log cache misses at trace level
 		c.logger.Trace().
 			Str("key", key).
 			Err(err).
-			Msg("Cache miss")
+			Msg("Persistent cache miss") // Clarify log message
 		c.recordError()
 		return nil, 0, false
 	}
+	// Persistent store hit, unlock read lock before potentially populating request cache
+	c.mu.RUnlock()
 
 	// Validate entry
 	if entry.Value == nil || len(entry.Value.Get()) == 0 {
@@ -392,15 +413,31 @@ func (c *DEKCache) Get(ctx context.Context, key string) (*types.SecureBytes, int
 		return nil, 0, false
 	}
 
-	c.stats.Hits++
+	c.stats.Hits++ // Count persistent store hit
 	c.stats.LastAccess = time.Now().UTC()
 
-	// Only log cache hits at trace level
+	// --- Populate Request Cache on Persistent Hit ---
+	c.requestCacheMu.Lock()
+	// Check if another goroutine populated it while we waited for the lock
+	_, alreadyExists := c.requestCache[key]
+	if !alreadyExists {
+		// Add a copy to avoid race conditions if entry is modified elsewhere
+		// No Expiry field needed here, cleanup routine handles it.
+		reqCacheEntry := &types.CacheEntry{
+			Value:   entry.Value, // SecureBytes is already a copy/pointer
+			Version: entry.Version,
+		}
+		c.requestCache[key] = reqCacheEntry
+		// c.logger.Trace().Str("key", key).Msg("Populated request cache from persistent hit") // Removed diagnostic log
+	}
+	c.requestCacheMu.Unlock()
+	// --- End Populate Request Cache ---
+
 	c.logger.Trace().
 		Str("key", key).
 		Int("version", entry.Version).
 		Int("valueSize", len(entry.Value.Get())).
-		Msg("Cache hit")
+		Msg("Persistent cache hit")
 
 	c.recordSuccess()
 	c.totalLatency += time.Since(start)
@@ -427,7 +464,7 @@ func (c *DEKCache) Set(ctx context.Context, key string, value []byte, version in
 	// Create secure bytes from value
 	secureValue := types.NewSecureBytes(value)
 	if secureValue == nil || len(secureValue.Get()) == 0 {
-		c.logger.Error().
+		log.Error().
 			Str("key", key).
 			Msg("Failed to create secure bytes")
 		return
@@ -440,22 +477,36 @@ func (c *DEKCache) Set(ctx context.Context, key string, value []byte, version in
 
 	err := c.store.Set(ctx, key, entry, c.config.GetEffectiveTTL())
 	if err != nil {
-		c.logger.Error().
+		log.Error().
 			Str("key", key).
 			Err(err).
 			Msg("Failed to cache DEK")
 		return
 	}
 
+	// --- Populate Request Cache on Set ---
+	c.requestCacheMu.Lock()
+	// Add a copy to avoid race conditions if entry is modified elsewhere
+	// No Expiry field needed here, cleanup routine handles it.
+	reqCacheEntry := &types.CacheEntry{
+		Value:   entry.Value, // SecureBytes is already a copy/pointer
+		Version: entry.Version,
+	}
+	c.requestCache[key] = reqCacheEntry
+	c.requestCacheMu.Unlock()
+	// c.logger.Trace().Str("key", key).Msg("Populated request cache on set") // Removed diagnostic log
+	// --- End Populate Request Cache ---
+
+	// Revert to original size update logic. Getting accurate size from store interface is hard.
 	c.stats.Size++
 	c.stats.LastUpdated = time.Now().UTC()
 
-	c.logger.Debug().
+	log.Debug().
 		Str("key", key).
 		Int("version", version).
 		Int("valueSize", len(value)).
 		Time("expires", time.Now().Add(c.config.GetEffectiveTTL())).
-		Msg("DEK cached successfully")
+		Msg("DEK cached successfully in persistent store")
 }
 
 // Delete removes a key and its associated value from the cache.
@@ -468,7 +519,7 @@ func (c *DEKCache) Delete(key string) {
 	defer c.mu.Unlock()
 
 	if err := c.store.Delete(context.Background(), key); err != nil {
-		c.logger.Debug().
+		log.Debug().
 			Str("key", key).
 			Err(err).
 			Msg("Failed to delete cache entry")
@@ -480,7 +531,7 @@ func (c *DEKCache) Delete(key string) {
 	}
 
 	// Only log successful deletion at trace level
-	c.logger.Trace().
+	log.Trace().
 		Str("key", key).
 		Msg("Cache entry deleted")
 }
@@ -585,7 +636,7 @@ func (c *DEKCache) cleanRequestCache() int {
 			entriesCleared = entriesCount
 
 			// Only log if entries were actually cleared
-			c.logger.Debug().
+			log.Debug().
 				Int("cleared_entries", entriesCount).
 				Msg("Request cache cleared")
 		}
@@ -621,7 +672,7 @@ func (c *DEKCache) startRequestCacheCleanup() {
 						avgEntriesPerCleanup = float64(totalEntriesCleared) / float64(cleanupCount)
 					}
 
-					c.logger.Info().
+					log.Info().
 						Int("cleanup_count", cleanupCount).
 						Int("total_entries_cleared", totalEntriesCleared).
 						Dur("interval", logInterval).
@@ -650,11 +701,11 @@ func (c *DEKCache) Shutdown(ctx context.Context) error {
 
 	// Clear main cache
 	if err := c.store.Clear(ctx); err != nil {
-		c.logger.Error().Err(err).Msg("Failed to clear cache during shutdown")
+		log.Error().Err(err).Msg("Failed to clear cache during shutdown")
 		return fmt.Errorf("failed to clear cache: %w", err)
 	}
 
-	c.logger.Info().
+	log.Info().
 		Int64("total_hits", c.stats.Hits).
 		Int64("total_misses", c.stats.Misses).
 		Int64("evictions", atomic.LoadInt64(&c.evictionCount)).

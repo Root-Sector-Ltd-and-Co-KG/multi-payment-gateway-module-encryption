@@ -31,15 +31,13 @@ type fieldService struct {
 	dekService interfaces.DEKService
 	logger     interfaces.AuditLogger
 	stats      types.FieldStats
-	scope      string // "system" or "organization"
-	id         string // User ID when scope is "user", Organization ID when scope is "organization"
+	// Removed scope and id fields - context should provide this info
 }
 
 // NewFieldService creates a new field encryption service
-func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger, scope string, id string) interfaces.FieldService {
+// NewFieldService creates a new field encryption service. Scope and ID are determined from context during operations.
+func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger) interfaces.FieldService {
 	log.Debug().
-		Str("scope", scope).
-		Str("id", id).
 		Bool("hasDEKService", dekSvc != nil).
 		Bool("hasLogger", logger != nil).
 		Msg("Creating new field service")
@@ -47,26 +45,21 @@ func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger
 	// If DEK service is nil, create a no-op service that only handles plaintext
 	if dekSvc == nil {
 		log.Trace().
-			Str("scope", scope).
-			Str("id", id).
 			Msg("Creating no-op field service (DEK service is nil)")
+		// No-op service still needs logger, but no scope/id stored
 		return &fieldService{
 			logger: logger,
-			scope:  scope,
-			id:     id,
 		}
 	}
 
 	svc := &fieldService{
 		dekService: dekSvc,
 		logger:     logger,
-		scope:      scope,
-		id:         id,
+		// scope and id removed
 	}
 
 	log.Debug().
-		Str("scope", scope).
-		Str("id", id).
+		// Removed scope/id logging from constructor message
 		Msg("Field service created successfully")
 
 	return svc
@@ -146,44 +139,66 @@ func (s *fieldService) createAuditEvent(ctx context.Context, field *types.FieldE
 		event.Context[string(audit.KeyOperation)] = op
 	}
 
-	// Add scope information
-	event.Context[string(audit.KeyScope)] = s.scope
-	if s.id != "" {
-		if s.scope == "organization" {
-			event.Context[string(audit.KeyOrgID)] = s.id
-		} else if s.scope == "user" {
-			event.Context[string(audit.KeyUserID)] = s.id
+	// Add scope information extracted from context
+	scope, scopeID := getScopeAndIDFromContext(ctx) // Use package-level helper
+	event.Context[string(audit.KeyScope)] = scope
+	if scopeID != "" {
+		// Add appropriate ID based on scope
+		if scope == "organization" {
+			event.Context[string(audit.KeyOrgID)] = scopeID
+		} else if scope == "user" { // Assuming "user" scope might exist
+			event.Context[string(audit.KeyUserID)] = scopeID
 		}
+		// Add other scope ID keys if necessary
 	}
 
 	return event
+}
+
+// buildAAD constructs the Additional Authenticated Data (AAD) string
+// using the full context: scope, id, collection, fieldName, and version.
+func (s *fieldService) buildAAD(ctx context.Context, version uint32) ([]byte, error) {
+	// Extract scope, scopeID, collection, and fieldName from context using helpers
+	scope, scopeID := getScopeAndIDFromContext(ctx)                 // Use package-level helper
+	collection, _, fieldName, _ := extractFieldInfoFromContext(ctx) // Use existing helper
+
+	// Log extracted/passed values for debugging AAD issues
+	log.Trace().
+		Str("scope", scope).
+		Str("scopeID", scopeID).
+		Str("collection", collection).
+		Str("fieldName", fieldName).
+		Uint32("version", version).
+		Msg("Building AAD with extracted context")
+
+	// Validate that we extracted necessary context
+	// Note: collectionName and fieldName are passed explicitly, so primarily check scope/scopeID
+	if scope == "unknown" || collection == "unknown" || fieldName == "unknown" || (scope == "organization" && scopeID == "") { // Added check for org scopeID
+		log.Error().
+			Str("scope", scope).
+			Str("scopeID", scopeID). // Use extracted scopeID
+			Str("extractedCollection", collection).
+			Str("extractedFieldName", fieldName).
+			Uint32("version", version).
+			Msgf("Failed to build AAD: Missing required context (scope=%s, scopeID=%s, collection=%s, fieldName=%s) for AAD construction", scope, scopeID, collection, fieldName) // Use Msgf for formatting
+		return nil, fmt.Errorf("missing required context (scope=%s, scopeID=%s, collection=%s, fieldName=%s) for AAD construction", scope, scopeID, collection, fieldName)
+	}
+
+	// Validate that we extracted necessary context
+	// Allow "unknown" only if explicitly permitted by configuration or design (currently enforcing)
+	// Construct AAD string using a consistent format (key=value, sorted keys recommended)
+	// Use extracted scope and scopeID
+	aadString := fmt.Sprintf("collection=%s:field=%s:id=%s:scope=%s:v=%d",
+		collection, fieldName, scopeID, scope, version)
+
+	log.Debug().Str("aad", aadString).Msg("Constructed AAD")
+	return []byte(aadString), nil
 }
 
 // Encrypt encrypts a field value if encryption is enabled
 func (s *fieldService) Encrypt(ctx context.Context, field *types.FieldEncrypted) error {
 	if field == nil {
 		return fmt.Errorf("field is nil")
-	}
-
-	// Extract field information from context
-	collection, recordID, fieldName, fieldType := extractFieldInfoFromContext(ctx)
-	email, userID, orgID, operation := extractUserInfoFromContext(ctx)
-
-	// Add context to audit event if available
-	if collection != "" || recordID != "" || fieldName != "" || fieldType != "" {
-		ctx = audit.WithContext(ctx, collection, fieldName, fieldType)
-		if recordID != "" {
-			ctx = audit.WithRecordID(ctx, recordID)
-		}
-		if email != "" || userID != "" {
-			ctx = audit.WithUserContext(ctx, userID, email)
-		}
-		if orgID != "" {
-			ctx = audit.WithOrganization(ctx, orgID)
-		}
-		if operation != "" {
-			ctx = audit.WithOperation(ctx, operation)
-		}
 	}
 
 	// Create audit event
@@ -217,15 +232,16 @@ func (s *fieldService) Encrypt(ctx context.Context, field *types.FieldEncrypted)
 		return nil
 	}
 
-	// Get the current DEK status to determine the active version
-	dekStatus, err := s.dekService.GetStatus(ctx, s.scope, s.id)
+	// Get the current DEK status using scope/ID from context
+	scope, scopeID := getScopeAndIDFromContext(ctx) // Use package-level helper
+	dekStatus, err := s.dekService.GetDEKStatus(ctx, scope, scopeID)
 	if err != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
 			auditEvent.Context["error"] = fmt.Sprintf("failed_get_dek_status: %v", err)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to get DEK status: %w", err)
+		return fmt.Errorf("failed to get DEK status for scope %s/%s: %w", scope, scopeID, err)
 	}
 
 	// If DEK is not active, operate in plaintext mode
@@ -248,17 +264,27 @@ func (s *fieldService) Encrypt(ctx context.Context, field *types.FieldEncrypted)
 	auditEvent.DEKVersion = dekStatus.Version
 
 	// Additional authenticated data (AAD) includes version for integrity
-	aad := []byte(fmt.Sprintf("v%d", field.Version))
-
-	// Get active DEK
-	dek, err := s.dekService.GetActiveDEK(ctx, s.scope, s.id)
+	aad, err := s.buildAAD(ctx, field.Version)
 	if err != nil {
+		// Log error and update audit event status
+		log.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Uint32("version", field.Version).Msg("Failed to build AAD during encryption")
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_get_active_dek: %v", err)
+			auditEvent.Context["error"] = fmt.Sprintf("failed_build_aad: %v", err)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to get active DEK: %w", err)
+		return fmt.Errorf("failed to build AAD for encryption: %w", err)
+	}
+
+	// Get active DEK using scope/ID from context
+	dek, dekErr := s.dekService.GetActiveDEK(ctx, scope, scopeID)
+	if dekErr != nil {
+		if s.logger != nil {
+			auditEvent.Status = audit.StatusFailed
+			auditEvent.Context["error"] = fmt.Sprintf("failed_get_active_dek: %v", dekErr)
+			s.logger.LogEvent(ctx, auditEvent)
+		}
+		return fmt.Errorf("failed to get active DEK: %w", dekErr)
 	}
 
 	// If no key is returned, keep plaintext
@@ -277,36 +303,36 @@ func (s *fieldService) Encrypt(ctx context.Context, field *types.FieldEncrypted)
 	}
 
 	// Create AES cipher
-	block, err := aes.NewCipher(dek)
-	if err != nil {
+	block, cipherErr := aes.NewCipher(dek)
+	if cipherErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_create_cipher: %v", err)
+			auditEvent.Context["error"] = fmt.Sprintf("failed_create_cipher: %v", cipherErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to create cipher: %w", err)
+		return fmt.Errorf("failed to create cipher: %w", cipherErr)
 	}
 
 	// Create GCM mode
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
+	gcm, gcmErr := cipher.NewGCM(block)
+	if gcmErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_create_gcm: %v", err)
+			auditEvent.Context["error"] = fmt.Sprintf("failed_create_gcm: %v", gcmErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to create GCM: %w", err)
+		return fmt.Errorf("failed to create GCM: %w", gcmErr)
 	}
 
 	// Generate random nonce
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
+	if _, nonceErr := rand.Read(nonce); nonceErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_generate_nonce: %v", err)
+			auditEvent.Context["error"] = fmt.Sprintf("failed_generate_nonce: %v", nonceErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to generate nonce: %w", err)
+		return fmt.Errorf("failed to generate nonce: %w", nonceErr)
 	}
 
 	// Encrypt plaintext with AAD
@@ -336,27 +362,6 @@ func (s *fieldService) Encrypt(ctx context.Context, field *types.FieldEncrypted)
 func (s *fieldService) Decrypt(ctx context.Context, field *types.FieldEncrypted) error {
 	if field == nil {
 		return fmt.Errorf("field is nil")
-	}
-
-	// Extract field information from context
-	collection, recordID, fieldName, fieldType := extractFieldInfoFromContext(ctx)
-	email, userID, orgID, operation := extractUserInfoFromContext(ctx)
-
-	// Add context to audit event if available
-	if collection != "" || recordID != "" || fieldName != "" || fieldType != "" {
-		ctx = audit.WithContext(ctx, collection, fieldName, fieldType)
-		if recordID != "" {
-			ctx = audit.WithRecordID(ctx, recordID)
-		}
-		if email != "" || userID != "" {
-			ctx = audit.WithUserContext(ctx, userID, email)
-		}
-		if orgID != "" {
-			ctx = audit.WithOrganization(ctx, orgID)
-		}
-		if operation != "" {
-			ctx = audit.WithOperation(ctx, operation)
-		}
 	}
 
 	// Create audit event
@@ -394,15 +399,16 @@ func (s *fieldService) Decrypt(ctx context.Context, field *types.FieldEncrypted)
 		return nil
 	}
 
-	// Create a Version struct for unwrapping
-	dekInfo, err := s.dekService.GetInfo(ctx, s.scope, s.id)
+	// Get DEK Info using scope/ID from context
+	scope, scopeID := getScopeAndIDFromContext(ctx) // Use package-level helper
+	dekInfo, err := s.dekService.GetInfo(ctx, scope, scopeID)
 	if err != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
 			auditEvent.Context["error"] = fmt.Sprintf("failed_get_dek_info: %v", err)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to get DEK info: %w", err)
+		return fmt.Errorf("failed to get DEK info for scope %s/%s: %w", scope, scopeID, err)
 	}
 
 	// Find the correct version
@@ -423,14 +429,21 @@ func (s *fieldService) Decrypt(ctx context.Context, field *types.FieldEncrypted)
 		return fmt.Errorf("DEK version %d not found", field.Version)
 	}
 
-	// Create a specific context for unwrapping, ensuring correct scope and ID
-	unwrapCtx := context.WithValue(ctx, audit.KeyScope, s.scope)
-	if s.scope == "organization" && s.id != "" {
-		unwrapCtx = context.WithValue(unwrapCtx, audit.KeyOrgID, s.id)
+	// Build AAD using the version stored in the field and the context
+	aad, err := s.buildAAD(ctx, field.Version)
+	if err != nil {
+		// Log error and update audit event status
+		log.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Uint32("version", field.Version).Msg("Failed to build AAD during decryption")
+		if s.logger != nil {
+			auditEvent.Status = audit.StatusFailed
+			auditEvent.Context["error"] = fmt.Sprintf("failed_build_aad: %v", err)
+			s.logger.LogEvent(ctx, auditEvent)
+		}
+		return fmt.Errorf("failed to build AAD for decryption: %w", err)
 	}
 
-	// Get DEK for version using the specific unwrap context
-	key, err := s.dekService.UnwrapDEK(unwrapCtx, version)
+	// Get DEK for version
+	key, err := s.dekService.UnwrapDEK(ctx, version)
 	if err != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
@@ -484,36 +497,33 @@ func (s *fieldService) Decrypt(ctx context.Context, field *types.FieldEncrypted)
 	}
 
 	// Create AES cipher
-	block, err := aes.NewCipher(key)
-	if err != nil {
+	block, cipherErr := aes.NewCipher(key)
+	if cipherErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_create_cipher: %v", err)
+			auditEvent.Context["error"] = fmt.Sprintf("failed_create_cipher: %v", cipherErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to create cipher: %w", err)
+		return fmt.Errorf("failed to create cipher: %w", cipherErr)
 	}
 
 	// Create GCM mode
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
+	gcm, gcmErr := cipher.NewGCM(block)
+	if gcmErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_create_gcm: %v", err)
+			auditEvent.Context["error"] = fmt.Sprintf("failed_create_gcm: %v", gcmErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to create GCM: %w", err)
+		return fmt.Errorf("failed to create GCM: %w", gcmErr)
 	}
 
-	// Additional authenticated data (AAD) includes version for integrity
-	aad := []byte(fmt.Sprintf("v%d", field.Version))
-
 	// Decrypt the data
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, aad)
-	if err != nil {
+	plaintextBytes, openErr := gcm.Open(nil, nonce, ciphertext, aad)
+	if openErr != nil {
 		// If we have plaintext, we can still proceed
 		if field.Plaintext != "" {
-			log.Warn().Err(err).Msg("Failed to decrypt data but plaintext available")
+			log.Warn().Err(openErr).Msg("Failed to decrypt data but plaintext available")
 			field.UpdatedAt = time.Now().UTC()
 			if s.logger != nil {
 				auditEvent.Status = audit.StatusSuccess
@@ -524,14 +534,14 @@ func (s *fieldService) Decrypt(ctx context.Context, field *types.FieldEncrypted)
 		}
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_decrypt: %v", err)
+			auditEvent.Context["error"] = fmt.Sprintf("failed_decrypt: %v", openErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to decrypt data: %w", err)
+		return fmt.Errorf("failed to decrypt data: %w", openErr)
 	}
 
 	// Update field with decrypted value
-	field.Plaintext = string(plaintext)
+	field.Plaintext = string(plaintextBytes)
 	field.UpdatedAt = time.Now().UTC()
 
 	// Update stats
@@ -557,27 +567,6 @@ func (s *fieldService) EncryptSearchable(ctx context.Context, field *types.Field
 
 	if searchKey == "" {
 		return ErrMissingSearchKey
-	}
-
-	// Extract field information from context
-	collection, recordID, fieldName, fieldType := extractFieldInfoFromContext(ctx)
-	email, userID, orgID, operation := extractUserInfoFromContext(ctx)
-
-	// Add context to audit event if available
-	if collection != "" || recordID != "" || fieldName != "" || fieldType != "" {
-		ctx = audit.WithContext(ctx, collection, fieldName, fieldType)
-		if recordID != "" {
-			ctx = audit.WithRecordID(ctx, recordID)
-		}
-		if email != "" || userID != "" {
-			ctx = audit.WithUserContext(ctx, userID, email)
-		}
-		if orgID != "" {
-			ctx = audit.WithOrganization(ctx, orgID)
-		}
-		if operation != "" {
-			ctx = audit.WithOperation(ctx, operation)
-		}
 	}
 
 	// Create audit event
@@ -607,15 +596,16 @@ func (s *fieldService) EncryptSearchable(ctx context.Context, field *types.Field
 		return nil
 	}
 
-	// Get system DEK info
-	systemStatus, err := s.dekService.GetStatus(ctx, s.scope, s.id)
+	// Get DEK status using scope/ID from context
+	scope, scopeID := getScopeAndIDFromContext(ctx) // Use package-level helper
+	systemStatus, err := s.dekService.GetDEKStatus(ctx, scope, scopeID)
 	if err != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
 			auditEvent.Context["error"] = err.Error()
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to get DEK status: %w", err)
+		return fmt.Errorf("failed to get DEK status for scope %s/%s: %w", scope, scopeID, err)
 	}
 
 	// If no active DEK, operate in plaintext mode
@@ -639,52 +629,62 @@ func (s *fieldService) EncryptSearchable(ctx context.Context, field *types.Field
 	field.Version = uint32(systemStatus.Version)
 	auditEvent.DEKVersion = systemStatus.Version
 
-	// Get DEK for encryption
-	dek, err := s.dekService.GetActiveDEK(ctx, s.scope, s.id)
+	// Additional authenticated data (AAD) includes version for integrity
+	aad, err := s.buildAAD(ctx, field.Version)
 	if err != nil {
+		// Log error and update audit event status
+		log.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Uint32("version", field.Version).Msg("Failed to build AAD during searchable encryption")
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = err.Error()
+			auditEvent.Context["error"] = fmt.Sprintf("failed_build_aad: %v", err)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to get active DEK: %w", err)
+		return fmt.Errorf("failed to build AAD for searchable encryption: %w", err)
+	}
+
+	// Get DEK for encryption using scope/ID from context
+	dek, dekErr := s.dekService.GetActiveDEK(ctx, scope, scopeID) // Use extracted scope/ID
+	if dekErr != nil {
+		if s.logger != nil {
+			auditEvent.Status = audit.StatusFailed
+			auditEvent.Context["error"] = fmt.Sprintf("failed_get_active_dek: %v", dekErr)
+			s.logger.LogEvent(ctx, auditEvent)
+		}
+		return fmt.Errorf("failed to get active DEK: %w", dekErr)
 	}
 
 	// Create AES cipher
-	block, err := aes.NewCipher(dek)
-	if err != nil {
+	block, cipherErr := aes.NewCipher(dek)
+	if cipherErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = err.Error()
+			auditEvent.Context["error"] = fmt.Sprintf("failed_create_cipher: %v", cipherErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to create cipher: %w", err)
+		return fmt.Errorf("failed to create cipher: %w", cipherErr)
 	}
 
 	// Create GCM mode
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
+	gcm, gcmErr := cipher.NewGCM(block)
+	if gcmErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = err.Error()
+			auditEvent.Context["error"] = fmt.Sprintf("failed_create_gcm: %v", gcmErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to create GCM: %w", err)
+		return fmt.Errorf("failed to create GCM: %w", gcmErr)
 	}
 
 	// Generate random nonce
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
+	if _, nonceErr := rand.Read(nonce); nonceErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = err.Error()
+			auditEvent.Context["error"] = fmt.Sprintf("failed_generate_nonce: %v", nonceErr)
 			s.logger.LogEvent(ctx, auditEvent)
 		}
-		return fmt.Errorf("failed to generate nonce: %w", err)
+		return fmt.Errorf("failed to generate nonce: %w", nonceErr)
 	}
-
-	// Additional authenticated data (AAD) includes version for integrity
-	aad := []byte(fmt.Sprintf("v%d", field.Version))
 
 	// Encrypt plaintext with AAD
 	ciphertext := gcm.Seal(nil, nonce, []byte(field.Plaintext), aad)
@@ -765,10 +765,11 @@ func (s *fieldService) Verify(ctx context.Context, field *types.FieldEncrypted) 
 		return fmt.Errorf("IV is required")
 	}
 
-	// Create a Version struct for unwrapping
-	dekInfo, err := s.dekService.GetInfo(ctx, s.scope, s.id)
+	// Get DEK Info using scope/ID from context
+	scope, scopeID := getScopeAndIDFromContext(ctx) // Use package-level helper
+	dekInfo, err := s.dekService.GetInfo(ctx, scope, scopeID)
 	if err != nil {
-		return fmt.Errorf("failed to get DEK info: %w", err)
+		return fmt.Errorf("failed to get DEK info for scope %s/%s: %w", scope, scopeID, err)
 	}
 
 	// Find the correct version
@@ -784,8 +785,8 @@ func (s *fieldService) Verify(ctx context.Context, field *types.FieldEncrypted) 
 		return fmt.Errorf("DEK version %d not found", field.Version)
 	}
 
-	// Get DEK for version
-	key, err := s.dekService.UnwrapDEK(ctx, version)
+	// Get DEK for version using scope/ID from context
+	key, err := s.dekService.UnwrapDEK(ctx, version) // UnwrapDEK itself uses context for AAD
 	if err != nil {
 		return fmt.Errorf("failed to get DEK: %w", err)
 	}
@@ -808,18 +809,23 @@ func (s *fieldService) Verify(ctx context.Context, field *types.FieldEncrypted) 
 	}
 
 	// Create GCM mode with default tag size (16 bytes)
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return fmt.Errorf("failed to create GCM: %w", err)
+	gcm, gcmErr := cipher.NewGCM(block)
+	if gcmErr != nil {
+		return fmt.Errorf("failed to create GCM: %w", gcmErr)
 	}
 
 	// Additional authenticated data (AAD) includes version for integrity
-	aad := []byte(fmt.Sprintf("v%d", field.Version))
+	aad, err := s.buildAAD(ctx, field.Version)
+	if err != nil {
+		// Log error - might not have audit event here, log directly
+		log.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Uint32("version", field.Version).Msg("Failed to build AAD during verification")
+		return fmt.Errorf("failed to build AAD for verification: %w", err)
+	}
 
 	// Attempt to decrypt to verify integrity
-	_, err = gcm.Open(nil, nonce, ciphertext, aad)
-	if err != nil {
-		return fmt.Errorf("failed to verify field: %w", err)
+	_, openErr := gcm.Open(nil, nonce, ciphertext, aad)
+	if openErr != nil {
+		return fmt.Errorf("failed to verify field: %w", openErr)
 	}
 
 	return nil
@@ -905,4 +911,28 @@ func (s *fieldService) ValidateAndCleanupEncryptedFields(ctx context.Context, fi
 		}
 	}
 	return nil
+}
+
+// Helper to get scope and scopeID from context (package level)
+func getScopeAndIDFromContext(ctx context.Context) (scope string, scopeID string) {
+	scope = ""   // Default to empty, let buildAAD enforce presence
+	scopeID = "" // Default
+
+	if val := ctx.Value(audit.KeyScope); val != nil {
+		if str, ok := val.(string); ok && str != "" {
+			scope = str
+		}
+	}
+
+	// Extract OrgID specifically if scope is organization
+	if scope == "organization" {
+		if val := ctx.Value(audit.KeyOrgID); val != nil {
+			if str, ok := val.(string); ok && str != "" {
+				scopeID = str
+			}
+		}
+	}
+	// Add logic for other scopes like "user" if needed
+
+	return scope, scopeID
 }

@@ -36,12 +36,11 @@ type DEKService interface {
 	// Base service methods
 	Initialize(ctx context.Context) error
 	GetAuditLogger() interface{}
-	GetFieldService() interface{}
 	GetTaskProcessor() interface{}
 
 	// Scoped operations
 	GetInfo(ctx context.Context, scope string, id string) (*types.DEKInfo, error)
-	GetStatus(ctx context.Context, scope string, id string) (*types.DEKStatus, error)
+	GetDEKStatus(ctx context.Context, scope string, id string) (*types.DEKStatus, error)
 	GetDEKStats(ctx context.Context, scope string, id string) (*types.DEKStats, error)
 	Create(ctx context.Context, scope string, id string) error
 	Rotate(ctx context.Context, scope string, id string) error
@@ -53,6 +52,16 @@ type DEKService interface {
 	UnwrapDEK(ctx context.Context, version *types.DEKVersion) ([]byte, error)
 	RotateDEK(ctx context.Context, scope string, orgID string, force bool) (*types.DEKInfo, error)
 	GetActiveDEK(ctx context.Context, scope string, orgID string) ([]byte, error)
+	InvalidateCache(ctx context.Context, scope string, scopeID string) error // Added for cache invalidation
+
+	// Placeholder methods for potential future interface consolidation (from old Service interface)
+	GetScopedFieldService(ctx context.Context) (FieldService, error)
+}
+
+// ConfigGetter defines the interface for retrieving encryption configuration based on scope.
+// This is typically implemented by a backend service that wraps the actual config storage.
+type ConfigGetter interface {
+	GetEncryptionConfig(ctx context.Context, scope string, scopeID string) (*types.EncryptionConfig, error)
 }
 
 // KMS Interfaces
