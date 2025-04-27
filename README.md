@@ -75,7 +75,7 @@ replace github.com/root-sector/multi-payment-gateway-module-encryption => ../mul
 Use the standard Go module dependency mechanism:
 
 ```go
-require github.com/root-sector/multi-payment-gateway-module-encryption v0.1.0
+require github.com/root-sector/multi-payment-gateway-module-encryption v1.0.1
 ```
 
 ## Directory Structure
@@ -123,13 +123,3 @@ Make sure that:
 - Integration with enterprise-grade KMS providers
 - Configurable security policies
 - Regular security updates and patches
-
-## Contributing
-
-When contributing to this module:
-
-1. Follow the existing code structure and patterns
-2. Ensure all new features are properly documented
-3. Include appropriate tests for new functionality
-4. Update the README.md when adding new features
-5. Follow security best practices for encryption implementations
