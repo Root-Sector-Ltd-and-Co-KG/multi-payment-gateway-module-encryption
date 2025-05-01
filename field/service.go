@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -65,10 +66,27 @@ func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger
 	return svc
 }
 
-// generateSearchHash creates an HMAC-SHA256 hash of the value using the provided search key
+// GenerateSearchHash creates a consistent hash for searchable encrypted fields.
+// It uses HMAC-SHA256 with a provided secret key.
 func generateSearchHash(value string, searchKey []byte) string {
+	if len(searchKey) == 0 {
+		log.Error().Msg("Search key is empty, cannot generate search hash.")
+		return "" // Return empty if key is missing
+	}
+	if value == "" {
+		return "" // Return empty if value is empty
+	}
+
+	// Normalize: Convert to lowercase and trim whitespace
+	normalizedValue := strings.ToLower(strings.TrimSpace(value))
+	if normalizedValue == "" {
+		log.Warn().Str("originalValue", value).Msg("Value became empty after normalization, returning empty search hash.")
+		return "" // Return empty if value was only whitespace
+	}
+
 	h := hmac.New(sha256.New, searchKey)
-	h.Write([]byte(value))
+	// Use the normalized value for hashing
+	h.Write([]byte(normalizedValue))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
