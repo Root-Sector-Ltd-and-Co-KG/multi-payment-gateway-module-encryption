@@ -4,7 +4,7 @@ package kms
 import (
 	"context"
 	"fmt"
-	"os"
+	"os" // Import os package
 	"strings"
 
 	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
@@ -29,34 +29,60 @@ type provider struct {
 func NewProvider(config Config) (Provider, error) {
 	var wrapper wrapping.Wrapper
 	var err error
+	var keyID, location string // Variables to hold common info for logging
 
+	// Initial log with just the type
 	log.Debug().
 		Str("provider", string(config.Type)).
-		Str("keyId", config.KeyID).
-		Str("region", config.Region).
 		Msg("Initializing KMS provider")
 
 	switch config.Type {
 	case types.ProviderAWS:
-		if err := validateAWSConfig(config); err != nil {
+		if config.AWS == nil {
+			return nil, fmt.Errorf("AWS configuration is missing for provider type %s", config.Type)
+		}
+		keyID = config.AWS.KeyID
+		location = config.AWS.Region
+		if err := validateAWSConfig(*config.AWS); err != nil {
 			return nil, fmt.Errorf("invalid AWS KMS configuration: %w", err)
 		}
-		wrapper, err = createAWSWrapper(config)
+		wrapper, err = createAWSWrapper(*config.AWS)
 	case types.ProviderAzure:
-		if err := validateAzureConfig(config); err != nil {
+		if config.Azure == nil {
+			return nil, fmt.Errorf("azure configuration is missing for provider type %s", config.Type)
+		}
+		keyID = config.Azure.KeyID
+		// Azure doesn't have a direct 'region' equivalent in the same way, log VaultAddress
+		location = config.Azure.VaultAddress
+		if err := validateAzureConfig(*config.Azure); err != nil {
 			return nil, fmt.Errorf("invalid Azure Key Vault configuration: %w", err)
 		}
-		wrapper, err = createAzureWrapper(config)
+		wrapper, err = createAzureWrapper(*config.Azure)
 	case types.ProviderGCP:
-		if err := validateGCPConfig(config); err != nil {
+		if config.GCP == nil {
+			return nil, fmt.Errorf("GCP configuration is missing for provider type %s", config.Type)
+		}
+		keyID = config.GCP.ResourceName // Use the full resource name as the primary identifier
+		// Validate first
+		if err := validateGCPConfig(*config.GCP); err != nil {
 			return nil, fmt.Errorf("invalid GCP KMS configuration: %w", err)
 		}
-		wrapper, err = createGCPWrapper(config)
+		// If validation passes, parsing for logging context is safe
+		parts := strings.Split(config.GCP.ResourceName, "/")
+		// Validation ensures len(parts) == 8 and parts[2] == "locations"
+		location = parts[3] // Extract actual location for logging
+
+		wrapper, err = createGCPWrapper(*config.GCP)
 	case types.ProviderVault:
-		if err := validateVaultConfig(config); err != nil {
+		if config.Vault == nil {
+			return nil, fmt.Errorf("vault configuration is missing for provider type %s", config.Type)
+		}
+		keyID = config.Vault.KeyID
+		location = config.Vault.VaultAddress // Log Vault address as location context
+		if err := validateVaultConfig(*config.Vault); err != nil {
 			return nil, fmt.Errorf("invalid Vault configuration: %w", err)
 		}
-		wrapper, err = createVaultWrapper(config)
+		wrapper, err = createVaultWrapper(*config.Vault)
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", config.Type)
 	}
@@ -66,9 +92,11 @@ func NewProvider(config Config) (Provider, error) {
 		return nil, fmt.Errorf("failed to create wrapper: %w", err)
 	}
 
+	// Log success with extracted keyID and location/address
 	log.Info().
 		Str("provider", string(config.Type)).
-		Str("keyId", config.KeyID).
+		Str("keyIdentifier", keyID).      // Use a more generic name for logging
+		Str("locationContext", location). // Use a more generic name for logging
 		Msg("KMS provider initialized successfully")
 
 	return &provider{
@@ -134,115 +162,145 @@ func (p *provider) GetLastHealthCheckError() error {
 }
 
 // validateAWSConfig validates AWS KMS configuration
-func validateAWSConfig(config Config) error {
-	if config.KeyID == "" {
-		return fmt.Errorf("key ID is required")
+func validateAWSConfig(awsConfig AWSConfig) error {
+	if awsConfig.KeyID == "" {
+		return fmt.Errorf("key ID (ARN) is required")
 	}
 
-	if config.Region == "" {
+	if awsConfig.Region == "" {
 		return fmt.Errorf("region is required")
 	}
 
-	if config.Credentials != nil {
-		_, hasAccessKey := config.Credentials["accessKeyId"].(string)
-		_, hasSecretKey := config.Credentials["secretAccessKey"].(string)
+	if awsConfig.Credentials != nil {
+		_, hasAccessKey := awsConfig.Credentials["accessKeyId"].(string)
+		_, hasSecretKey := awsConfig.Credentials["secretAccessKey"].(string)
 		if (hasAccessKey && !hasSecretKey) || (!hasAccessKey && hasSecretKey) {
 			return fmt.Errorf("both accessKeyId and secretAccessKey must be provided if using credentials")
 		}
+	} else {
+		log.Info().Msg("AWS credentials not provided in config, assuming environment variables or default credentials")
 	}
 
 	return nil
 }
 
 // validateAzureConfig validates Azure Key Vault configuration
-func validateAzureConfig(config Config) error {
-	if config.KeyID == "" {
-		return fmt.Errorf("key ID is required")
+func validateAzureConfig(azureConfig AzureConfig) error {
+	if azureConfig.KeyID == "" {
+		return fmt.Errorf("key ID (URL) is required")
+	}
+	// Validate VaultAddress format (basic check)
+	if !strings.HasPrefix(azureConfig.VaultAddress, "https://") || !strings.Contains(azureConfig.VaultAddress, ".vault.azure.net") {
+		return fmt.Errorf("vault address must be a valid Azure Key Vault URL (e.g., https://myvault.vault.azure.net)")
 	}
 
-	if config.Credentials != nil {
+	if azureConfig.Credentials != nil {
 		requiredFields := []string{"tenantId", "clientId", "clientSecret"}
 		for _, field := range requiredFields {
-			if _, ok := config.Credentials[field].(string); !ok {
-				return fmt.Errorf("%s is required in credentials", field)
+			if val, ok := azureConfig.Credentials[field].(string); !ok || val == "" {
+				return fmt.Errorf("%s is required in credentials and cannot be empty", field)
 			}
 		}
+	} else {
+		// If credentials are not provided, the library might use other auth methods (e.g., MSI)
+		log.Info().Msg("Azure credentials not provided, assuming alternative authentication method (e.g., Managed Identity)")
 	}
 
 	return nil
 }
 
 // validateGCPConfig validates GCP KMS configuration
-func validateGCPConfig(config Config) error {
-	if config.KeyID == "" {
-		return fmt.Errorf("key ID is required")
+func validateGCPConfig(gcpConfig GCPConfig) error {
+	if gcpConfig.ResourceName == "" {
+		return fmt.Errorf("resource name is required")
+	}
+	// Basic format validation for ResourceName
+	// projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}
+	parts := strings.Split(gcpConfig.ResourceName, "/")
+	if len(parts) != 8 || parts[0] != "projects" || parts[2] != "locations" || parts[4] != "keyRings" || parts[6] != "cryptoKeys" {
+		return fmt.Errorf("invalid resource name format. Expected: projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}")
+	}
+	if parts[1] == "" || parts[3] == "" || parts[5] == "" || parts[7] == "" {
+		return fmt.Errorf("project, location, keyRing, and cryptoKey components in resource name cannot be empty")
 	}
 
-	if config.Region == "" {
-		return fmt.Errorf("region is required")
-	}
-
-	if config.Credentials != nil {
-		if _, ok := config.Credentials["credentialsJson"].(string); !ok {
-			return fmt.Errorf("credentialsJson is required in credentials")
+	// Credentials check: Must have credentialsJson if Credentials map exists
+	// This is needed because we write it to a temp file for the library.
+	if gcpConfig.Credentials != nil {
+		credsJSON, ok := gcpConfig.Credentials["credentialsJson"].(string)
+		if !ok || credsJSON == "" {
+			return fmt.Errorf("credentialsJson is required in credentials map and cannot be empty")
 		}
+	} else {
+		// If credentials are not provided, ADC might still work if running on GCP infra or GOOGLE_APPLICATION_CREDENTIALS is set externally.
+		// However, for consistency and explicit configuration, we require it here.
+		// If ADC is the intended method, the Credentials map should be omitted entirely from the config.
+		// This validation enforces that *if* the Credentials map is present, credentialsJson must be inside.
+		// If the map is nil, we assume ADC is intended.
+		log.Info().Msg("GCP credentials map not provided in config, assuming Application Default Credentials (ADC).")
 	}
 
 	return nil
 }
 
 // validateVaultConfig validates HashiCorp Vault configuration
-func validateVaultConfig(config Config) error {
-	if config.KeyID == "" {
-		return fmt.Errorf("key ID is required")
+func validateVaultConfig(vaultConfig VaultConfig) error {
+	if vaultConfig.KeyID == "" {
+		return fmt.Errorf("key ID (key name) is required")
 	}
 
-	if config.VaultAddress == "" {
+	if vaultConfig.VaultAddress == "" {
 		return fmt.Errorf("vault address is required")
 	}
 
-	if config.Credentials != nil {
-		if _, ok := config.Credentials["token"].(string); !ok {
-			return fmt.Errorf("token is required in credentials")
+	// VaultMount is optional, defaults handled by library
+
+	if vaultConfig.Credentials != nil {
+		if token, ok := vaultConfig.Credentials["token"].(string); !ok || token == "" {
+			return fmt.Errorf("token is required in credentials map and cannot be empty")
 		}
+	} else {
+		// Token might come from env (VAULT_TOKEN) or other auth methods
+		log.Info().Msg("Vault token not provided in config, assuming VAULT_TOKEN environment variable or other auth method")
 	}
 
 	return nil
 }
 
 // createAWSWrapper creates an AWS KMS wrapper
-func createAWSWrapper(config Config) (wrapping.Wrapper, error) {
+func createAWSWrapper(awsConfig AWSConfig) (wrapping.Wrapper, error) {
 	wrapper := awskms.NewWrapper()
 
 	// Create config map with AWS KMS specific options
 	configMap := map[string]string{
-		"kms_key_id": config.KeyID,
-		"region":     config.Region,
+		"kms_key_id": awsConfig.KeyID,
+		"region":     awsConfig.Region,
 	}
 
 	// Add credentials if provided
-	if config.Credentials != nil {
+	if awsConfig.Credentials != nil {
 		// Log credential presence without exposing sensitive data
 		hasCredentials := map[string]bool{
-			"accessKey":    config.Credentials["accessKeyId"] != nil,
-			"secretKey":    config.Credentials["secretAccessKey"] != nil,
-			"sessionToken": config.Credentials["sessionToken"] != nil,
+			"accessKey":    awsConfig.Credentials["accessKeyId"] != nil,
+			"secretKey":    awsConfig.Credentials["secretAccessKey"] != nil,
+			"sessionToken": awsConfig.Credentials["sessionToken"] != nil,
 		}
 
 		log.Debug().
 			Interface("credentials", hasCredentials).
-			Msg("Configuring AWS KMS credentials")
+			Msg("Configuring AWS KMS credentials from config")
 
-		if accessKey, ok := config.Credentials["accessKeyId"].(string); ok && accessKey != "" {
+		if accessKey, ok := awsConfig.Credentials["accessKeyId"].(string); ok && accessKey != "" {
 			configMap["access_key"] = accessKey
 		}
-		if secretKey, ok := config.Credentials["secretAccessKey"].(string); ok && secretKey != "" {
+		if secretKey, ok := awsConfig.Credentials["secretAccessKey"].(string); ok && secretKey != "" {
 			configMap["secret_key"] = secretKey
 		}
-		if sessionToken, ok := config.Credentials["sessionToken"].(string); ok && sessionToken != "" {
+		if sessionToken, ok := awsConfig.Credentials["sessionToken"].(string); ok && sessionToken != "" {
 			configMap["session_token"] = sessionToken
 		}
 	}
+	// No else needed, validation already logged info message if creds are nil
 
 	// Configure the wrapper
 	_, err := wrapper.SetConfig(context.Background(), wrapping.WithConfigMap(configMap))
@@ -254,43 +312,70 @@ func createAWSWrapper(config Config) (wrapping.Wrapper, error) {
 }
 
 // createAzureWrapper creates an Azure Key Vault wrapper
-func createAzureWrapper(config Config) (wrapping.Wrapper, error) {
+func createAzureWrapper(azureConfig AzureConfig) (wrapping.Wrapper, error) {
 	wrapper := azurekeyvault.NewWrapper()
 
 	// Create config map with Azure Key Vault specific options
-	configMap := map[string]string{
-		"key_name": config.KeyID,
+	// Example KeyID URL: https://myvault.vault.azure.net/keys/mykey/version
+	keyName := azureConfig.KeyID // Default to full ID if parsing fails
+	keyVersion := ""
+	vaultName := ""
+
+	// Parse KeyID URL
+	parts := strings.Split(azureConfig.KeyID, "/")
+	if len(parts) >= 5 && parts[3] == "keys" { // Basic check for URL structure
+		keyName = parts[4]
+		if len(parts) >= 6 {
+			keyVersion = parts[5]
+		}
+	} else {
+		log.Warn().Str("keyId", azureConfig.KeyID).Msg("Azure KeyID does not look like a standard Key Identifier URL. Using the full value as key_name.")
 	}
 
-	// Extract vault name from address if provided
-	if config.VaultAddress != "" {
-		vaultName := strings.Split(config.VaultAddress, ".")[0]
-		configMap["vault_name"] = vaultName
+	// Parse VaultAddress URL (Validation ensures it's in the correct format)
+	prefixRemoved := strings.TrimPrefix(azureConfig.VaultAddress, "https://")
+	vaultNameParts := strings.Split(prefixRemoved, ".")
+	if len(vaultNameParts) > 0 {
+		vaultName = vaultNameParts[0]
+	} else {
+		// This case should be caught by validation
+		return nil, fmt.Errorf("could not parse vault name from VaultAddress: %s", azureConfig.VaultAddress)
+	}
+
+	configMap := map[string]string{
+		"key_name":   keyName,
+		"vault_name": vaultName,
+		// Pass vault_url explicitly as the library might need it
+		"vault_url": azureConfig.VaultAddress,
+	}
+	if keyVersion != "" {
+		configMap["key_version"] = keyVersion
 	}
 
 	// Add credentials if provided
-	if config.Credentials != nil {
+	if azureConfig.Credentials != nil {
 		// Log credential presence without exposing sensitive data
 		hasCredentials := map[string]bool{
-			"tenantId":     config.Credentials["tenantId"] != nil,
-			"clientId":     config.Credentials["clientId"] != nil,
-			"clientSecret": config.Credentials["clientSecret"] != nil,
+			"tenantId":     azureConfig.Credentials["tenantId"] != nil,
+			"clientId":     azureConfig.Credentials["clientId"] != nil,
+			"clientSecret": azureConfig.Credentials["clientSecret"] != nil,
 		}
 
 		log.Debug().
 			Interface("credentials", hasCredentials).
-			Msg("Configuring Azure Key Vault credentials")
+			Msg("Configuring Azure Key Vault credentials from config")
 
-		if tenantID, ok := config.Credentials["tenantId"].(string); ok {
+		if tenantID, ok := azureConfig.Credentials["tenantId"].(string); ok {
 			configMap["tenant_id"] = tenantID
 		}
-		if clientID, ok := config.Credentials["clientId"].(string); ok {
+		if clientID, ok := azureConfig.Credentials["clientId"].(string); ok {
 			configMap["client_id"] = clientID
 		}
-		if clientSecret, ok := config.Credentials["clientSecret"].(string); ok {
+		if clientSecret, ok := azureConfig.Credentials["clientSecret"].(string); ok {
 			configMap["client_secret"] = clientSecret
 		}
 	}
+	// No else needed here, validation already logged info message if creds are nil
 
 	// Configure the wrapper
 	_, err := wrapper.SetConfig(context.Background(), wrapping.WithConfigMap(configMap))
@@ -302,62 +387,82 @@ func createAzureWrapper(config Config) (wrapping.Wrapper, error) {
 }
 
 // createGCPWrapper creates a Google Cloud KMS wrapper
-func createGCPWrapper(config Config) (wrapping.Wrapper, error) {
+func createGCPWrapper(gcpConfig GCPConfig) (wrapping.Wrapper, error) {
 	wrapper := gcpckms.NewWrapper()
-	// Parse key ID to extract project, location, key ring, and crypto key
-	//parts := strings.Split(config.KeyID, "/")
-	//if len(parts) < 8 {
-	//	return nil, fmt.Errorf("invalid GCP key ID format. Expected: projects/{project}/locations/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}")
-	// Extract project ID from credentials JSON
-	var projectID string
-	if config.Credentials != nil {
-		if credsJSON, ok := config.Credentials["credentialsJson"].(string); ok {
-			// Parse project ID from credentials JSON
-			// Note: This is a simplified example. In production, you should properly parse the JSON
-			if strings.Contains(credsJSON, "project_id") {
-				projectID = strings.Split(strings.Split(credsJSON, "project_id\":\"")[1], "\"")[0]
-			}
-		}
-	}
-	if projectID == "" {
-		return nil, fmt.Errorf("project ID not found in credentials JSON")
-	}
 
-	// Construct the full key ID
-	fullKeyID := fmt.Sprintf("projects/%s/locations/%s/keyRings/%s/cryptoKeys/%s",
-		projectID,
-		config.Region,
-		config.KeyRing,
-		config.KeyID)
+	// --- Parse Resource Name ---
+	parts := strings.Split(gcpConfig.ResourceName, "/")
+	if len(parts) != 8 || parts[0] != "projects" || parts[2] != "locations" || parts[4] != "keyRings" || parts[6] != "cryptoKeys" {
+		// Validation should prevent this, but check again
+		return nil, fmt.Errorf("internal error: invalid resource name format passed validation: %s", gcpConfig.ResourceName)
+	}
+	parsedProject := parts[1]
+	parsedLocation := parts[3]
+	parsedKeyRing := parts[5]
+	parsedCryptoKey := parts[7]
+	// --- End Parse Resource Name ---
 
-	// Create config map with GCP KMS specific options
+	// Project ID is taken directly from the parsed ResourceName
+	projectID := parsedProject
+	log.Debug().Str("projectID", projectID).Msg("Using project ID parsed from ResourceName")
+
+	// Create config map with GCP KMS specific options using parsed values
 	configMap := map[string]string{
-		//"project":    parts[1],
-		//"region":     parts[3],
-		//"key_ring":   parts[5],
-		//"crypto_key": parts[7],
-		"key_id": fullKeyID,
+		"project":    projectID,       // Use project ID from ResourceName
+		"region":     parsedLocation,  // Use parsed location, maps to library's 'region'
+		"key_ring":   parsedKeyRing,   // Use parsed key ring
+		"crypto_key": parsedCryptoKey, // Use parsed crypto key name
 	}
 
-	// Add credentials if provided
-	if config.Credentials != nil {
-		// Log credential presence without exposing sensitive data
-		hasCredentials := map[string]bool{
-			"credentialsJson": config.Credentials["credentialsJson"] != nil,
+	// --- Temporary File for Credentials ---
+	// If credentials are provided, write to temp file and pass path to library
+	if gcpConfig.Credentials != nil {
+		var ok bool
+		credsJSON, ok := gcpConfig.Credentials["credentialsJson"].(string)
+		if !ok || credsJSON == "" {
+			// Validation should have caught this
+			return nil, fmt.Errorf("internal error: invalid or missing credentialsJson in GCP config credentials")
 		}
 
-		log.Debug().
-			Interface("credentials", hasCredentials).
-			Msg("Configuring GCP KMS credentials")
-
-		if credsJSON, ok := config.Credentials["credentialsJson"].(string); ok {
-			configMap["credentials"] = credsJSON
+		tempFile, err := os.CreateTemp("", "gcp-creds-*.json")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temporary credentials file: %w", err)
 		}
+		// Ensure cleanup happens even if subsequent steps fail
+		defer func() {
+			errRemove := os.Remove(tempFile.Name())
+			if errRemove != nil {
+				log.Error().Err(errRemove).Str("filePath", tempFile.Name()).Msg("Failed to remove temporary credentials file")
+			} else {
+				log.Debug().Str("filePath", tempFile.Name()).Msg("Successfully removed temporary credentials file")
+			}
+		}()
+
+		if _, err := tempFile.Write([]byte(credsJSON)); err != nil {
+			// Attempt to close before returning error
+			if closeErr := tempFile.Close(); closeErr != nil {
+				log.Error().Err(closeErr).Str("filePath", tempFile.Name()).Msg("Failed to close temporary credentials file after write error")
+			}
+			return nil, fmt.Errorf("failed to write credentials to temporary file: %w", err)
+		}
+		if err := tempFile.Close(); err != nil {
+			// Log error but proceed, file might still be usable by SDK
+			log.Error().Err(err).Str("filePath", tempFile.Name()).Msg("Failed to close temporary credentials file after successful write")
+		}
+
+		configMap["credentials"] = tempFile.Name() // Pass the temp file path
+		log.Debug().Str("tempFilePath", tempFile.Name()).Msg("Configuring GCP KMS credentials using temporary file path")
+	} else {
+		// If no credentials provided in config, rely on ADC (env var, metadata server, etc.)
+		log.Info().Msg("GCP credentials not provided in config, relying on Application Default Credentials (ADC).")
+		// Do NOT add "credentials" key to configMap in this case
 	}
+	// --- End Temporary File ---
 
 	// Configure the wrapper
 	_, err := wrapper.SetConfig(context.Background(), wrapping.WithConfigMap(configMap))
 	if err != nil {
+		// Wrap the underlying error for better context
 		return nil, fmt.Errorf("failed to configure GCP KMS wrapper: %w", err)
 	}
 
@@ -365,31 +470,31 @@ func createGCPWrapper(config Config) (wrapping.Wrapper, error) {
 }
 
 // createVaultWrapper creates a HashiCorp Vault Transit wrapper
-func createVaultWrapper(config Config) (wrapping.Wrapper, error) {
+func createVaultWrapper(vaultConfig VaultConfig) (wrapping.Wrapper, error) {
 	wrapper := transit.NewWrapper()
 
 	// Create config map with Vault Transit specific options
 	configMap := map[string]string{
-		"address":    config.VaultAddress,
-		"mount_path": config.VaultMount,
-		"key_name":   config.KeyID,
+		"address":  vaultConfig.VaultAddress,
+		"key_name": vaultConfig.KeyID, // This is the key name in Vault
+	}
+	// Add mount path only if it's non-empty
+	if vaultConfig.VaultMount != "" {
+		configMap["mount_path"] = vaultConfig.VaultMount
 	}
 
-	// Add credentials if provided
-	if config.Credentials != nil {
-		// Log credential presence without exposing sensitive data
-		hasCredentials := map[string]bool{
-			"token": config.Credentials["token"] != nil,
-		}
-
-		log.Debug().
-			Interface("credentials", hasCredentials).
-			Msg("Configuring Vault Transit credentials")
-
-		if token, ok := config.Credentials["token"].(string); ok {
+	// Add token if provided
+	if vaultConfig.Credentials != nil {
+		if token, ok := vaultConfig.Credentials["token"].(string); ok && token != "" {
 			configMap["token"] = token
+			log.Debug().Msg("Configuring Vault Transit credentials from config (token)")
+		} else if !ok {
+			// If Credentials map exists but token is missing/invalid type
+			return nil, fmt.Errorf("invalid or missing token in Vault config credentials")
 		}
+		// If token is empty string, validation should have caught it.
 	}
+	// No else needed, validation already logged info message if creds are nil
 
 	// Configure the wrapper
 	_, err := wrapper.SetConfig(context.Background(), wrapping.WithConfigMap(configMap))

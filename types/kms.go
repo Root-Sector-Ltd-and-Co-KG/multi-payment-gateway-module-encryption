@@ -37,12 +37,11 @@ type KMSCredentials struct {
 type EncryptionConfig struct {
 	Enabled      bool            `json:"enabled" bson:"enabled"`
 	Provider     ProviderType    `json:"provider" bson:"provider"`
-	KeyID        string          `json:"keyId" bson:"keyId"`
-	Region       string          `json:"region,omitempty" bson:"region,omitempty"`
-	KeyRing      string          `json:"keyRing,omitempty" bson:"keyRing,omitempty"`
-	VaultAddress string          `json:"vaultAddress,omitempty" bson:"vaultAddress,omitempty"`
-	VaultMount   string          `json:"vaultMount,omitempty" bson:"vaultMount,omitempty"`
-	Credentials  *KMSCredentials `json:"credentials,omitempty" bson:"credentials,omitempty"`
+	KeyID        string          `json:"keyId" bson:"keyId"`                                   // Key identifier (ARN for AWS, URL for Azure, ResourceName for GCP, Key Name for Vault)
+	Region       string          `json:"region,omitempty" bson:"region,omitempty"`             // AWS Region (Only used by AWS)
+	VaultAddress string          `json:"vaultAddress,omitempty" bson:"vaultAddress,omitempty"` // Vault address, also used for Azure Vault URL base
+	VaultMount   string          `json:"vaultMount,omitempty" bson:"vaultMount,omitempty"`     // Vault transit mount path
+	Credentials  *KMSCredentials `json:"credentials,omitempty" bson:"credentials,omitempty"`   // Encrypted credentials
 	Cache        CacheConfig     `json:"cache" bson:"cache"`
 	AuditLog     AuditLogConfig  `json:"auditLog" bson:"auditLog"`
 	RotateAfter  time.Duration   `json:"rotateAfter" bson:"rotateAfter"`

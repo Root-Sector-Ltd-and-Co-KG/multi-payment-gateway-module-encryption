@@ -25,7 +25,7 @@ const (
 )
 
 type cacheEntry struct {
-	value     interface{} // Can store either *types.DEKInfo or []byte
+	value     interface{}
 	expiresAt time.Time
 }
 
@@ -54,6 +54,14 @@ func (s *MongoDBStore) getCacheKey(scope, orgID string) string {
 
 // StoreDEK stores a DEK in the appropriate document based on scope
 func (s *MongoDBStore) StoreDEK(ctx context.Context, info *types.DEKInfo, scope string, orgID string) error {
+	// +++ Add Logging +++
+	log.Info().
+		Str("method", "StoreDEK").
+		Str("scope", scope).
+		Str("orgID", orgID). // Log the received orgID string
+		Msg("Entering StoreDEK")
+	// +++ End Logging +++
+
 	// Update timestamps
 	info.UpdatedAt = time.Now().UTC()
 	if info.CreatedAt.IsZero() {
@@ -65,9 +73,22 @@ func (s *MongoDBStore) StoreDEK(ctx context.Context, info *types.DEKInfo, scope 
 
 	if scope == "system" {
 		collection = "system"
-		filter = bson.M{"_id": "1"} // Target the specific system document
+		filter = bson.M{"_id": "1"}
 	} else if scope == "organization" {
+		// +++ Add Logging Inside Scope Check +++
+		log.Info().
+			Str("method", "StoreDEK").
+			Str("scope", scope).
+			Str("orgID", orgID).
+			Msg("Processing organization scope")
+		// +++ End Logging +++
 		if orgID == "" {
+			// +++ Add Logging Before Error +++
+			log.Error().
+				Str("method", "StoreDEK").
+				Str("scope", scope).
+				Msg("orgID is empty, returning error")
+			// +++ End Logging +++
 			return fmt.Errorf("organization ID is required for organization scope")
 		}
 		collection = "organizations"
@@ -121,7 +142,7 @@ func (s *MongoDBStore) GetDEK(ctx context.Context, id string, scope string) (*ty
 
 	if scope == "system" {
 		collection = "system"
-		filter = bson.M{"_id": "1"} // Target the specific system document
+		filter = bson.M{"_id": "1"}
 	} else if scope == "organization" {
 		collection = "organizations"
 		// Convert id string to ObjectID for filtering

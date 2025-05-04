@@ -454,16 +454,66 @@ func convertKMSCredentialsToMap(creds interface{}) map[string]interface{} {
 // Helper function to convert config to KMS config
 func toKMSConfig(config *types.EncryptionConfig) kms.Config {
 	if config == nil {
+		// Return an empty config, maybe log a warning?
+		log.Warn().Msg("toKMSConfig called with nil EncryptionConfig")
 		return kms.Config{}
 	}
 
-	return kms.Config{
-		Type:         config.Provider,
-		KeyID:        config.KeyID,
-		Region:       config.Region,
-		KeyRing:      config.KeyRing,
-		VaultAddress: config.VaultAddress,
-		VaultMount:   config.VaultMount,
-		Credentials:  convertKMSCredentialsToMap(config.Credentials),
+	kmsCfg := kms.Config{
+		Type: config.Provider, // Set the provider type
 	}
+
+	// Convert the generic *types.KMSCredentials to map[string]interface{}
+	// This map is expected by the provider-specific structs.
+	var credsMap map[string]interface{}
+	if config.Credentials != nil { // Add nil check here
+		credsMap = convertKMSCredentialsToMap(config.Credentials)
+	} else {
+		credsMap = make(map[string]interface{}) // Ensure credsMap is not nil
+	}
+
+	// Populate the appropriate nested struct based on the provider type
+	switch config.Provider {
+	case types.ProviderAWS:
+		kmsCfg.AWS = &kms.AWSConfig{
+			KeyID:       config.KeyID, // AWS uses KeyID (ARN)
+			Region:      config.Region,
+			Credentials: credsMap,
+		}
+	case types.ProviderAzure:
+		kmsCfg.Azure = &kms.AzureConfig{
+			KeyID:        config.KeyID, // Azure uses KeyID (URL)
+			VaultAddress: config.VaultAddress,
+			Credentials:  credsMap,
+		}
+	case types.ProviderGCP:
+		kmsCfg.GCP = &kms.GCPConfig{
+			// GCP uses ResourceName in the new structure
+			ResourceName: config.KeyID, // Assuming KeyID from EncryptionConfig holds the ResourceName for GCP
+			Credentials:  credsMap,
+			// KeyRing and Location are parsed from ResourceName later in createGCPWrapper
+		}
+		// We might need to adjust how KeyID/ResourceName is handled if EncryptionConfig doesn't store the full ResourceName for GCP.
+		// For now, assuming config.KeyID contains the GCP Resource Name based on previous context.
+		// Removed check for deprecated KeyRing/Region fields as they are removed from EncryptionConfig struct.
+		if kmsCfg.GCP.ResourceName == "" {
+			// This check remains relevant - if KeyID (holding ResourceName) is empty, it's an issue.
+			// However, the initial check in calling functions should prevent this.
+			log.Error().Msg("GCP ResourceName (expected in KeyID field) is missing in EncryptionConfig during kms.Config conversion.")
+		}
+
+	case types.ProviderVault:
+		kmsCfg.Vault = &kms.VaultConfig{
+			KeyID:        config.KeyID, // Vault uses KeyID (key name)
+			VaultAddress: config.VaultAddress,
+			VaultMount:   config.VaultMount,
+			Credentials:  credsMap,
+		}
+	default:
+		// Log error for unsupported provider type
+		log.Error().Str("provider", string(config.Provider)).Msg("Unsupported provider type encountered in toKMSConfig")
+		// Return the partially filled kmsCfg (only Type is set)
+	}
+
+	return kmsCfg
 }
