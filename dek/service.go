@@ -1170,21 +1170,19 @@ func (s *dekService) GetActiveDEK(ctx context.Context, scope string, orgID strin
 		return nil, fmt.Errorf("no active DEK found for scope %s/%s", scope, orgID)
 	}
 	currentVersionNumber := currentInfo.Version
-	dekInfoId := currentInfo.Id // Get ID from fetched info
+	dekInfoId := currentInfo.Id
 
 	// Try cache first if enabled
 	if s.cache != nil && s.cache.IsEnabled() {
 		// Use the current version number for the cache key
-		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, currentVersionNumber) // Removed dekInfoId
+		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, currentVersionNumber)
 		if keyErr == nil {
-			// --- DEBUG LOGGING ADDED ---
 			s.zLogger.Debug().
 				Str("cacheKeyAttempt", cacheKey).
 				Str("scope", scope).
 				Str("orgID", orgID).
 				Int("version", currentVersionNumber).
 				Msg("GetActiveDEK: Attempting to GET unwrapped DEK from cache")
-			// --- END DEBUG LOGGING ---
 			if dek, cachedVersion, found := s.cache.Get(ctx, cacheKey); found && dek != nil && len(dek.Get()) > 0 {
 				// Verify the cached version matches the current version from the store
 				if cachedVersion == currentVersionNumber {
@@ -1222,7 +1220,7 @@ func (s *dekService) GetActiveDEK(ctx context.Context, scope string, orgID strin
 	latestVersion := currentInfo.Versions[len(currentInfo.Versions)-1]
 
 	// Unwrap and cache the DEK (UnwrapDEK handles caching internally)
-	return s.UnwrapDEK(ctx, &latestVersion) // Calls UnwrapDEK
+	return s.UnwrapDEK(ctx, &latestVersion)
 }
 
 // GetDEKStatus gets the status of a DEK for a specific scope and organization
