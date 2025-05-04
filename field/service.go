@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -32,11 +33,9 @@ type fieldService struct {
 	dekService interfaces.DEKService
 	logger     interfaces.AuditLogger
 	stats      types.FieldStats
-	// Removed scope and id fields - context should provide this info
 }
 
 // NewFieldService creates a new field encryption service
-// NewFieldService creates a new field encryption service. Scope and ID are determined from context during operations.
 func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger) interfaces.FieldService {
 	log.Debug().
 		Bool("hasDEKService", dekSvc != nil).
@@ -47,7 +46,6 @@ func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger
 	if dekSvc == nil {
 		log.Trace().
 			Msg("Creating no-op field service (DEK service is nil)")
-		// No-op service still needs logger, but no scope/id stored
 		return &fieldService{
 			logger: logger,
 		}
@@ -56,7 +54,6 @@ func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger
 	svc := &fieldService{
 		dekService: dekSvc,
 		logger:     logger,
-		// scope and id removed
 	}
 
 	log.Debug().
@@ -71,10 +68,10 @@ func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger
 func generateSearchHash(value string, searchKey []byte) string {
 	if len(searchKey) == 0 {
 		log.Error().Msg("Search key is empty, cannot generate search hash.")
-		return "" // Return empty if key is missing
+		return ""
 	}
 	if value == "" {
-		return "" // Return empty if value is empty
+		return ""
 	}
 
 	// Normalize: Convert to lowercase and trim whitespace
@@ -367,12 +364,6 @@ func (s *fieldService) Encrypt(ctx context.Context, field *types.FieldEncrypted)
 	s.stats.LastEncryptTime = now
 	s.stats.LastOpTime = now
 
-	// REMOVED: Redundant audit log. Factory logs this event.
-	// if s.logger != nil {
-	// 	auditEvent.Status = audit.StatusSuccess
-	// 	s.logger.LogEvent(ctx, auditEvent)
-	// }
-
 	return nil
 }
 
@@ -568,12 +559,6 @@ func (s *fieldService) Decrypt(ctx context.Context, field *types.FieldEncrypted)
 	s.stats.LastDecryptTime = now
 	s.stats.LastOpTime = now
 
-	// REMOVED: Redundant audit log. Factory logs this event.
-	// if s.logger != nil {
-	// 	auditEvent.Status = audit.StatusSuccess
-	// 	s.logger.LogEvent(ctx, auditEvent)
-	// }
-
 	return nil
 }
 
@@ -587,15 +572,27 @@ func (s *fieldService) EncryptSearchable(ctx context.Context, field *types.Field
 		return ErrMissingSearchKey
 	}
 
+	// Decode the hex search key
+	decodedSearchKey, err := hex.DecodeString(searchKey)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to decode search key for EncryptSearchable")
+		return fmt.Errorf("invalid search key format: %w", err)
+	}
+	// Basic validation after decoding (optional, but good practice)
+	if len(decodedSearchKey) == 0 {
+		log.Error().Msg("Decoded search key is empty for EncryptSearchable")
+		return fmt.Errorf("decoded search key cannot be empty")
+	}
+
 	// Create audit event
 	auditEvent := s.createAuditEvent(ctx, field, audit.EventTypeFieldEncrypt, audit.OperationEncrypt)
 
 	// Always update timestamp
 	field.UpdatedAt = time.Now().UTC()
 
-	// Generate HMAC-SHA256 search hash first
+	// Generate HMAC-SHA256 search hash first using the decoded key
 	if field.Plaintext != "" {
-		field.SearchHash = generateSearchHash(field.Plaintext, []byte(searchKey))
+		field.SearchHash = generateSearchHash(field.Plaintext, decodedSearchKey) // Use decoded key
 	}
 
 	// If DEK service is nil or encryption is disabled, just update timestamp and return
@@ -615,7 +612,7 @@ func (s *fieldService) EncryptSearchable(ctx context.Context, field *types.Field
 	}
 
 	// Get DEK status using scope/ID from context
-	scope, scopeID := getScopeAndIDFromContext(ctx) // Use package-level helper
+	scope, scopeID := getScopeAndIDFromContext(ctx)
 	systemStatus, err := s.dekService.GetDEKStatus(ctx, scope, scopeID)
 	if err != nil {
 		if s.logger != nil {
@@ -661,7 +658,7 @@ func (s *fieldService) EncryptSearchable(ctx context.Context, field *types.Field
 	}
 
 	// Get DEK for encryption using scope/ID from context
-	dek, dekErr := s.dekService.GetActiveDEK(ctx, scope, scopeID) // Use extracted scope/ID
+	dek, dekErr := s.dekService.GetActiveDEK(ctx, scope, scopeID)
 	if dekErr != nil {
 		if s.logger != nil {
 			auditEvent.Status = audit.StatusFailed
@@ -737,13 +734,25 @@ func (s *fieldService) Match(ctx context.Context, field *types.FieldEncrypted, v
 		return false, ErrMissingSearchKey
 	}
 
+	// Decode the hex search key
+	decodedSearchKey, err := hex.DecodeString(searchKey)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to decode search key for Match")
+		// Return false and error as we cannot perform the match
+		return false, fmt.Errorf("invalid search key format: %w", err)
+	}
+	if len(decodedSearchKey) == 0 {
+		log.Error().Msg("Decoded search key is empty for Match")
+		return false, fmt.Errorf("decoded search key cannot be empty")
+	}
+
 	// If field has no search hash, return false
 	if field.SearchHash == "" {
 		return false, nil
 	}
 
-	// Generate HMAC-SHA256 hash of search value
-	searchHash := generateSearchHash(value, []byte(searchKey))
+	// Generate HMAC-SHA256 hash of search value using the decoded key
+	searchHash := generateSearchHash(value, decodedSearchKey) // Use decoded key
 
 	// Compare hashes
 	return searchHash == field.SearchHash, nil
@@ -784,7 +793,7 @@ func (s *fieldService) Verify(ctx context.Context, field *types.FieldEncrypted) 
 	}
 
 	// Get DEK Info using scope/ID from context
-	scope, scopeID := getScopeAndIDFromContext(ctx) // Use package-level helper
+	scope, scopeID := getScopeAndIDFromContext(ctx)
 	dekInfo, err := s.dekService.GetInfo(ctx, scope, scopeID)
 	if err != nil {
 		return fmt.Errorf("failed to get DEK info for scope %s/%s: %w", scope, scopeID, err)
@@ -950,7 +959,6 @@ func getScopeAndIDFromContext(ctx context.Context) (scope string, scopeID string
 			}
 		}
 	}
-	// Add logic for other scopes like "user" if needed
 
 	return scope, scopeID
 }
