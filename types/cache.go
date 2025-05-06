@@ -103,27 +103,6 @@ type CacheStats struct {
 	LastUpdated time.Time `json:"lastUpdated" bson:"lastUpdated"`
 }
 
-// // Storage defines the interface for cache storage backends
-// type Storage interface {
-// 	// Get retrieves a value from storage
-// 	Get(ctx context.Context, key string, value interface{}) error
-
-// 	// Set stores a value in storage
-// 	Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error
-
-// 	// Delete removes a value from storage and securely wipes it
-// 	Delete(ctx context.Context, key string) error
-
-// 	// Clear removes all values from storage and securely wipes them
-// 	Clear(ctx context.Context) error
-
-// 	// GetStats returns storage statistics
-// 	GetStats(ctx context.Context) CacheStats
-
-// 	// ClearExpiredKeys removes only expired keys and returns the count of removed entries
-// 	ClearExpiredKeys(ctx context.Context) (int, error)
-// }
-
 // Cache defines the interface for caching operations
 type Cache interface {
 	// Enable enables the cache
