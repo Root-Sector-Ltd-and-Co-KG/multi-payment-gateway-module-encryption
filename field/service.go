@@ -37,7 +37,7 @@ type fieldService struct {
 
 // NewFieldService creates a new field encryption service
 func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger) interfaces.FieldService {
-	log.Debug().
+	log.Trace().
 		Bool("hasDEKService", dekSvc != nil).
 		Bool("hasLogger", logger != nil).
 		Msg("Creating new field service")
@@ -56,7 +56,7 @@ func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger
 		logger:     logger,
 	}
 
-	log.Debug().
+	log.Trace().
 		// Removed scope/id logging from constructor message
 		Msg("Field service created successfully")
 
@@ -206,7 +206,7 @@ func (s *fieldService) buildAAD(ctx context.Context, version uint32) ([]byte, er
 	aadString := fmt.Sprintf("collection=%s:field=%s:id=%s:scope=%s:v=%d",
 		collection, fieldName, scopeID, scope, version)
 
-	log.Debug().Str("aad", aadString).Msg("Constructed AAD")
+	log.Trace().Str("aad", aadString).Msg("Constructed AAD")
 	return []byte(aadString), nil
 }
 

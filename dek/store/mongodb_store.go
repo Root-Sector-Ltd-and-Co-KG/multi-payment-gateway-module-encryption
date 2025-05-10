@@ -177,7 +177,7 @@ func (s *MongoDBStore) GetActiveDEK(ctx context.Context, scope string, orgID str
 	if cached, ok := s.cache.Load(cacheKey); ok {
 		if entry, ok := cached.(*cacheEntry); ok && time.Now().Before(entry.expiresAt) {
 			if dekInfo, ok := entry.value.(*types.DEKInfo); ok {
-				log.Debug().
+				log.Trace().
 					Str("scope", scope).
 					Str("orgID", orgID).
 					Str("cacheKey", cacheKey).
