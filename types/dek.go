@@ -98,13 +98,14 @@ func (v *DEKVersion) GetFlags() uint64 {
 
 // Status represents the status of a DEK
 type DEKStatus struct {
-	Exists      bool         `json:"exists" bson:"exists"`
-	Active      bool         `json:"active" bson:"active"`
-	Version     int          `json:"version" bson:"version"`
-	CreatedAt   time.Time    `json:"createdAt" bson:"createdAt"`
-	UpdatedAt   time.Time    `json:"updatedAt" bson:"updatedAt"`
-	Provider    ProviderType `json:"provider" bson:"provider"`
-	NeedsRotate bool         `json:"needsRotate" bson:"needsRotate"`
+	Exists        bool         `json:"exists" bson:"exists"`
+	Active        bool         `json:"active" bson:"active"`
+	Version       int          `json:"version" bson:"version"`
+	CreatedAt     time.Time    `json:"createdAt" bson:"createdAt"`
+	UpdatedAt     time.Time    `json:"updatedAt" bson:"updatedAt"`
+	Provider      ProviderType `json:"provider" bson:"provider"`
+	ProviderKeyID string       `json:"providerKeyId,omitempty" bson:"providerKeyId,omitempty"`
+	NeedsRotate   bool         `json:"needsRotate" bson:"needsRotate"`
 }
 
 // Stats holds statistics about the DEK service

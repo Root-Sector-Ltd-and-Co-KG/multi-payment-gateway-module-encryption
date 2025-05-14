@@ -246,8 +246,8 @@ func (s *dekService) Initialize(ctx context.Context) error {
 	if info != nil && len(info.Versions) > 0 {
 		latestVersion := info.Versions[len(info.Versions)-1]
 		// Use a background context for the unwrap check during initialization
-		unwrapCtx := context.Background()                        // Use a background context for initialization tasks
-		dek, unwrapErr := s.UnwrapDEK(unwrapCtx, &latestVersion) // UnwrapDEK handles its own locking
+		unwrapCtx := context.Background()                                         // Use a background context for initialization tasks
+		dek, unwrapErr := s.UnwrapDEK(unwrapCtx, &latestVersion, scopeSystem, "") // UnwrapDEK handles its own locking
 		if unwrapErr != nil || len(dek) == 0 {
 			verificationError = fmt.Errorf("failed to verify DEK unwrapping during initialization: %w", unwrapErr)
 			s.zLogger.Error().
@@ -297,13 +297,13 @@ func (s *dekService) Initialize(ctx context.Context) error {
 		dekToCache := verificationDEK
 		infoVersion := info.Version
 
-		go func(dek []byte, version int) { // Removed id parameter
+		go func(dek []byte, version int, scope string, orgID string) { // Removed id parameter
 			cacheCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
 			// Use the already unwrapped DEK from the verification step
 			// Pass background context as scope isn't strictly necessary here (assuming system for init)
-			cacheKey, keyErr := s.getUnwrappedCacheKey(cacheCtx, version) // Pass only ctx and version
+			cacheKey, keyErr := s.getUnwrappedCacheKey(cacheCtx, version, scope, orgID) // Pass only ctx, version, and explicit scope/orgID
 			if keyErr == nil {
 				// Use the Set method from types.Cache interface
 				// Set does not return an error, so just call it.
@@ -312,7 +312,7 @@ func (s *dekService) Initialize(ctx context.Context) error {
 			} else {
 				s.zLogger.Warn().Err(keyErr).Msg("Failed to generate cache key for pre-caching")
 			}
-		}(dekToCache, infoVersion) // Pass only copies/values needed to the goroutine
+		}(dekToCache, infoVersion, scopeSystem, "") // Pass only copies/values needed to the goroutine
 	}
 
 	s.zLogger.Info().
@@ -679,7 +679,7 @@ func (s *dekService) GetDEK(ctx context.Context, id string) ([]byte, error) {
 	latestVersion := info.Versions[len(info.Versions)-1]
 
 	// Unwrap the key
-	dek, err := s.UnwrapDEK(ctx, &latestVersion)
+	dek, err := s.UnwrapDEK(ctx, &latestVersion, scopeSystem, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to unwrap key: %w", err)
 	}
@@ -793,8 +793,12 @@ func (s *dekService) getCacheKey(scope, orgID string) (string, error) {
 // getUnwrappedCacheKey generates a cache key for unwrapped DEKs
 // It no longer uses dekId to avoid inconsistencies between callers.
 // The key is now based solely on scope, orgID (if applicable), and version.
-func (s *dekService) getUnwrappedCacheKey(ctx context.Context, version int) (string, error) {
-	scope, orgID := s.getScopeFromContext(ctx)
+func (s *dekService) getUnwrappedCacheKey(ctx context.Context, version int, scope string, orgID string) (string, error) {
+	// If scope/orgID are not passed, try to get from context as a fallback (should be rare)
+	if scope == "" {
+		scope, orgID = s.getScopeFromContext(ctx) // Fallback, but prefer explicit params
+		s.zLogger.Warn().Msg("getUnwrappedCacheKey called without explicit scope, falling back to context-derived scope.")
+	}
 
 	if scope == scopeSystem {
 		// Format: dek:system:v<version>
@@ -812,7 +816,7 @@ func (s *dekService) getUnwrappedCacheKey(ctx context.Context, version int) (str
 }
 
 // UnwrapDEK unwraps a DEK version using the configured KMS provider
-func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) ([]byte, error) {
+func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion, scope string, orgID string) ([]byte, error) {
 	cacheStatusLog := s.zLogger.Trace()
 	cacheIsNil := s.cache == nil
 	cacheIsEnabled := false
@@ -831,8 +835,7 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 	}
 
 	// Determine scope/orgID early for dynamic lookups
-	scope, orgID := s.getScopeFromContext(ctx)
-
+	// Use passed-in scope and orgID directly for logging and consistency check with cache context derivation
 	s.zLogger.Trace().
 		Int("version", int(version.Version)).
 		Str("keyId", version.BlobInfo.KeyInfo.KeyId).
@@ -844,7 +847,7 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 
 	// Try cache first if enabled
 	if s.cache != nil && s.cache.IsEnabled() {
-		cacheKey, err := s.getUnwrappedCacheKey(ctx, version.Version)
+		cacheKey, err := s.getUnwrappedCacheKey(ctx, version.Version, scope, orgID)
 		if err == nil {
 			s.zLogger.Trace().
 				Str("cacheKeyAttempt", cacheKey).
@@ -869,7 +872,7 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 		}
 	}
 
-	// Get provider dynamically (scope/orgID already determined)
+	// Get provider dynamically (scope/orgID already determined by parameters)
 	provider, err := s.kmsGetter.GetKMSProvider(ctx, scope, orgID)
 	if err != nil {
 		s.zLogger.Error().Err(err).Str("scope", scope).Str("orgID", orgID).Msg("Failed to get KMS provider for unwrapping")
@@ -951,7 +954,7 @@ func (s *dekService) UnwrapDEK(ctx context.Context, version *types.DEKVersion) (
 
 	// Cache the unwrapped DEK if enabled
 	if s.cache != nil && s.cache.IsEnabled() {
-		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, version.Version)
+		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, version.Version, scope, orgID)
 		if keyErr == nil {
 			s.zLogger.Trace().
 				Str("cacheKey", cacheKey).
@@ -1042,7 +1045,7 @@ func (s *dekService) RotateDEK(ctx context.Context, scope string, orgID string, 
 		if orgID != "" {
 			unwrapCtx = context.WithValue(unwrapCtx, audit.KeyOrgID, orgID)
 		}
-		plaintextDEK, err = s.UnwrapDEK(unwrapCtx, currentVersionData) // Pass the enriched context
+		plaintextDEK, err = s.UnwrapDEK(unwrapCtx, currentVersionData, scope, orgID) // Pass the enriched context
 		if err != nil {
 			return nil, fmt.Errorf("failed to unwrap current DEK version: %w", err)
 		}
@@ -1175,7 +1178,7 @@ func (s *dekService) GetActiveDEK(ctx context.Context, scope string, orgID strin
 	// Try cache first if enabled
 	if s.cache != nil && s.cache.IsEnabled() {
 		// Use the current version number for the cache key
-		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, currentVersionNumber)
+		cacheKey, keyErr := s.getUnwrappedCacheKey(ctx, currentVersionNumber, scope, orgID)
 		if keyErr == nil {
 			s.zLogger.Trace().
 				Str("cacheKeyAttempt", cacheKey).
@@ -1220,7 +1223,7 @@ func (s *dekService) GetActiveDEK(ctx context.Context, scope string, orgID strin
 	latestVersion := currentInfo.Versions[len(currentInfo.Versions)-1]
 
 	// Unwrap and cache the DEK (UnwrapDEK handles caching internally)
-	return s.UnwrapDEK(ctx, &latestVersion)
+	return s.UnwrapDEK(ctx, &latestVersion, scope, orgID)
 }
 
 // GetDEKStatus gets the status of a DEK for a specific scope and organization
@@ -1244,10 +1247,11 @@ func (s *dekService) GetDEKStatus(ctx context.Context, scope string, orgID strin
 		// If not found, return default status with the provider type from config
 		if strings.Contains(err.Error(), "not found") || err == mongo.ErrNoDocuments {
 			return &types.DEKStatus{
-				Exists:      false,
-				Active:      false,
-				Provider:    types.ProviderType(providerType),
-				NeedsRotate: false,
+				Exists:        false,
+				Active:        false,
+				Provider:      types.ProviderType(providerType),
+				ProviderKeyID: "", // Ensure ProviderKeyID is initialized
+				NeedsRotate:   false,
 			}, nil
 		}
 		// For other store errors, return the error
@@ -1258,23 +1262,33 @@ func (s *dekService) GetDEKStatus(ctx context.Context, scope string, orgID strin
 	if info == nil {
 		s.zLogger.Warn().Str("scope", scope).Str("orgID", orgID).Msg("GetActiveDEK returned nil info without error, treating as non-existent")
 		return &types.DEKStatus{
-			Exists:      false,
-			Active:      false,
-			Provider:    types.ProviderType(providerType),
-			NeedsRotate: false,
+			Exists:        false,
+			Active:        false,
+			Provider:      types.ProviderType(providerType),
+			ProviderKeyID: "", // Ensure ProviderKeyID is initialized
+			NeedsRotate:   false,
 		}, nil
 	}
 
 	needsRotate := false
+	var providerKeyID string
+	if info.Active && len(info.Versions) > 0 {
+		// Get the latest (active) version
+		latestVersion := info.Versions[len(info.Versions)-1]
+		if latestVersion.BlobInfo != nil && latestVersion.BlobInfo.KeyInfo != nil {
+			providerKeyID = latestVersion.BlobInfo.KeyInfo.KeyId
+		}
+	}
 
 	status := &types.DEKStatus{
-		Exists:      true,
-		Active:      info.Active,
-		Version:     info.Version,
-		CreatedAt:   info.CreatedAt,
-		UpdatedAt:   info.UpdatedAt,
-		Provider:    types.ProviderType(providerType),
-		NeedsRotate: needsRotate,
+		Exists:        true,
+		Active:        info.Active,
+		Version:       info.Version,
+		CreatedAt:     info.CreatedAt,
+		UpdatedAt:     info.UpdatedAt,
+		Provider:      types.ProviderType(providerType),
+		ProviderKeyID: providerKeyID, // Populate ProviderKeyID
+		NeedsRotate:   needsRotate,
 	}
 
 	return status, nil
@@ -1370,55 +1384,53 @@ func (s *dekService) InvalidateCache(ctx context.Context, scope string, scopeID 
 // defined in the context. It checks configuration and initializes necessary components
 // (like KMS provider, DEK info) on-demand.
 func (s *dekService) GetScopedFieldService(ctx context.Context) (interfaces.FieldService, error) {
-	// 1. Extract scope and scopeID from context
-	scope, scopeID := s.getScopeFromContext(ctx)
-	s.zLogger.Trace().Str("scope", scope).Str("scopeID", scopeID).Msg("GetScopedFieldService called")
+	s.zLogger.Trace().Msg("GetScopedFieldService called in DEK service")
 
-	// 2. Fetch configuration for the scope using ConfigGetter
+	// 1. Extract scope and scopeID from context first.
+	scope, scopeID := s.getScopeFromContext(ctx)
+	s.zLogger.Trace().Str("scope", scope).Str("scopeID", scopeID).Msg("Extracted scope and ID for FieldService")
+
+	// 2. Check if encryption is configured and enabled for the extracted scope.
 	config, err := s.configGetter.GetEncryptionConfig(ctx, scope, scopeID)
 	if err != nil {
-		// If config not found, treat as disabled
 		if err == mongo.ErrNoDocuments || strings.Contains(err.Error(), "not found") {
 			s.zLogger.Info().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption config not found for scope, returning no-op FieldService.")
-			return field.NewFieldService(nil, s.logger), nil // Return no-op service (nil DEKProvider)
+			return field.NewFieldService(nil, s.logger, s.zLogger, scope, scopeID), nil
 		}
-		// For other errors fetching config, return the error
 		s.zLogger.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to get encryption config for scope")
 		return nil, fmt.Errorf("failed to get encryption config for scope %s/%s: %w", scope, scopeID, err)
 	}
 
-	// 3. Check if encryption is enabled in the fetched config
-	if config == nil || !config.Enabled {
+	// 3. If config exists, check if encryption is enabled.
+	if config == nil || !config.Enabled { // config == nil check is defensive
 		s.zLogger.Trace().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption explicitly disabled for scope, returning no-op FieldService.")
-		return field.NewFieldService(nil, s.logger), nil // Return no-op service (nil DEKProvider)
+		return field.NewFieldService(nil, s.logger, s.zLogger, scope, scopeID), nil
 	}
 
-	// 4. Encryption is enabled - Ensure necessary components are ready
 	s.zLogger.Trace().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption enabled for scope. Ensuring KMS and DEK are ready.")
 
 	// 4a. Get KMS Provider (will be cached by the getter implementation)
-	// Pass the original context down
 	kmsProvider, err := s.kmsGetter.GetKMSProvider(ctx, scope, scopeID)
 	if err != nil {
 		s.zLogger.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to get KMS provider for enabled scope")
 		return nil, fmt.Errorf("failed to get KMS provider for scope %s/%s: %w", scope, scopeID, err)
 	}
 	if kmsProvider == nil {
-		// This should ideally not happen if config.Enabled is true and config is valid, but handle defensively.
 		s.zLogger.Error().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption enabled but KMS provider is nil")
 		return nil, fmt.Errorf("encryption enabled but KMS provider is not available for scope %s/%s", scope, scopeID)
 	}
 
 	// 4b. Load DEK Info (using the store, which handles its own caching via loadDEKInfo)
-	// Use the original context
-	dekInfo, err := s.loadDEKInfo(ctx)
+	// Note: s.loadDEKInfo() uses the scope/orgID from the context it *receives* (ctx),
+	// which should have been properly set up by the caller of GetScopedFieldService.
+	// If s.loadDEKInfo() needs explicit scope/orgID, this part might need adjustment.
+	// For now, assuming context propagation handles it.
+	dekInfo, err := s.loadDEKInfo(ctx) // This uses the original ctx, assuming it has the correct scope for loadDEKInfo
 	if err != nil {
-		// If DEK not found, we cannot proceed with encryption/decryption
-		if strings.Contains(err.Error(), "not found") {
+		if strings.Contains(err.Error(), "not found") || err == mongo.ErrNoDocuments {
 			s.zLogger.Error().Str("scope", scope).Str("scopeID", scopeID).Msg("Encryption enabled but no active DEK found for scope")
 			return nil, fmt.Errorf("encryption enabled but no active DEK found for scope %s/%s", scope, scopeID)
 		}
-		// Other error loading DEK info
 		s.zLogger.Error().Err(err).Str("scope", scope).Str("scopeID", scopeID).Msg("Failed to load DEK info for enabled scope")
 		return nil, fmt.Errorf("failed to load DEK info for scope %s/%s: %w", scope, scopeID, err)
 	}
@@ -1428,9 +1440,9 @@ func (s *dekService) GetScopedFieldService(ctx context.Context) (interfaces.Fiel
 	}
 
 	// 4c. Perform necessary internal checks (e.g., try unwrapping the latest DEK version)
-	// This ensures the KMS connection and key are valid for the current context.
 	latestVersion := dekInfo.Versions[len(dekInfo.Versions)-1]
-	_, unwrapErr := s.UnwrapDEK(ctx, &latestVersion)
+	// Pass the correct scope and scopeID to UnwrapDEK
+	_, unwrapErr := s.UnwrapDEK(ctx, &latestVersion, scope, scopeID)
 	if unwrapErr != nil {
 		s.zLogger.Error().Err(unwrapErr).Str("scope", scope).Str("scopeID", scopeID).Int("dekVersion", latestVersion.Version).Msg("DEK verification failed: Unable to unwrap latest DEK version")
 		return nil, fmt.Errorf("DEK verification failed for scope %s/%s: %w", scope, scopeID, unwrapErr)
@@ -1438,8 +1450,6 @@ func (s *dekService) GetScopedFieldService(ctx context.Context) (interfaces.Fiel
 	s.zLogger.Trace().Str("scope", scope).Str("scopeID", scopeID).Int("dekVersion", latestVersion.Version).Msg("DEK verification successful.")
 
 	// 5. Return a properly configured FieldService instance
-	// The field.Service needs a DEKProvider, which dekService implements (GetActiveDEK, UnwrapDEK).
 	s.zLogger.Trace().Str("scope", scope).Str("scopeID", scopeID).Msg("Returning configured FieldService for scope.")
-
-	return field.NewFieldService(s, s.logger), nil
+	return field.NewFieldService(s, s.logger, s.zLogger, scope, scopeID), nil
 }

@@ -49,7 +49,7 @@ type DEKService interface {
 	// Low-level DEK operations
 	CreateDEK(ctx context.Context, scope string, orgID string) (*types.DEKInfo, error)
 	DeleteDEK(ctx context.Context, scope string, orgID string) error
-	UnwrapDEK(ctx context.Context, version *types.DEKVersion) ([]byte, error)
+	UnwrapDEK(ctx context.Context, version *types.DEKVersion, scope string, orgID string) ([]byte, error)
 	RotateDEK(ctx context.Context, scope string, orgID string, force bool) (*types.DEKInfo, error)
 	GetActiveDEK(ctx context.Context, scope string, orgID string) ([]byte, error)
 	InvalidateCache(ctx context.Context, scope string, scopeID string) error // Added for cache invalidation

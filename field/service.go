@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	"github.com/root-sector/multi-payment-gateway-module-encryption/audit"
@@ -33,31 +34,47 @@ type fieldService struct {
 	dekService interfaces.DEKService
 	logger     interfaces.AuditLogger
 	stats      types.FieldStats
+	scope      string
+	orgID      string
+	zLogger    zerolog.Logger
 }
 
 // NewFieldService creates a new field encryption service
-func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger) interfaces.FieldService {
-	log.Trace().
+func NewFieldService(dekSvc interfaces.DEKService, logger interfaces.AuditLogger, zLogger zerolog.Logger, scope string, orgID string) interfaces.FieldService {
+	// Use provided zLogger or default to global log.Logger
+	opLogger := zLogger
+	if opLogger.GetLevel() == zerolog.Disabled {
+		opLogger = log.Logger
+	}
+
+	opLogger.Trace().
 		Bool("hasDEKService", dekSvc != nil).
 		Bool("hasLogger", logger != nil).
+		Str("scope", scope).
+		Str("orgID", orgID).
 		Msg("Creating new field service")
 
 	// If DEK service is nil, create a no-op service that only handles plaintext
 	if dekSvc == nil {
-		log.Trace().
+		opLogger.Trace().
 			Msg("Creating no-op field service (DEK service is nil)")
 		return &fieldService{
-			logger: logger,
+			logger:  logger,
+			zLogger: opLogger,
+			scope:   scope,
+			orgID:   orgID,
 		}
 	}
 
 	svc := &fieldService{
 		dekService: dekSvc,
 		logger:     logger,
+		zLogger:    opLogger,
+		scope:      scope,
+		orgID:      orgID,
 	}
 
-	log.Trace().
-		// Removed scope/id logging from constructor message
+	opLogger.Trace().
 		Msg("Field service created successfully")
 
 	return svc
@@ -451,13 +468,17 @@ func (s *fieldService) Decrypt(ctx context.Context, field *types.FieldEncrypted)
 		return fmt.Errorf("failed to build AAD for decryption: %w", err)
 	}
 
-	// Get DEK for version
-	key, err := s.dekService.UnwrapDEK(ctx, version)
+	// Get DEK for version using stored scope/ID
+	key, err := s.dekService.UnwrapDEK(ctx, version, s.scope, s.orgID)
 	if err != nil {
 		if s.logger != nil {
-			auditEvent.Status = audit.StatusFailed
-			auditEvent.Context["error"] = fmt.Sprintf("failed_unwrap_dek: %v", err)
-			s.logger.LogEvent(ctx, auditEvent)
+			if auditEvent != nil {
+				auditEvent.Status = audit.StatusFailed
+				auditEvent.Context["error"] = fmt.Sprintf("failed_unwrap_dek: %v", err)
+				s.logger.LogEvent(ctx, auditEvent)
+			} else {
+				s.zLogger.Error().Err(err).Str("scope", s.scope).Str("orgID", s.orgID).Msg("Audit event (auditEvent) was nil during DEK unwrap failure in Decrypt method")
+			}
 		}
 		return fmt.Errorf("failed to get DEK: %w", err)
 	}
@@ -812,9 +833,18 @@ func (s *fieldService) Verify(ctx context.Context, field *types.FieldEncrypted) 
 		return fmt.Errorf("DEK version %d not found", field.Version)
 	}
 
-	// Get DEK for version using scope/ID from context
-	key, err := s.dekService.UnwrapDEK(ctx, version) // UnwrapDEK itself uses context for AAD
+	// Get DEK for version using stored scope/ID
+	key, err := s.dekService.UnwrapDEK(ctx, version, s.scope, s.orgID)
 	if err != nil {
+		if s.logger != nil {
+			if event != nil {
+				event.Status = audit.StatusFailed
+				event.Context["error"] = fmt.Sprintf("failed_unwrap_dek: %v", err)
+				s.logger.LogEvent(ctx, event)
+			} else {
+				s.zLogger.Error().Err(err).Str("scope", s.scope).Str("orgID", s.orgID).Msg("Audit event (event) was nil during DEK unwrap failure in Verify method")
+			}
+		}
 		return fmt.Errorf("failed to get DEK: %w", err)
 	}
 
@@ -852,6 +882,15 @@ func (s *fieldService) Verify(ctx context.Context, field *types.FieldEncrypted) 
 	// Attempt to decrypt to verify integrity
 	_, openErr := gcm.Open(nil, nonce, ciphertext, aad)
 	if openErr != nil {
+		if s.logger != nil {
+			if event != nil {
+				event.Status = audit.StatusFailed
+				event.Context["error"] = fmt.Sprintf("gcm_open_failed: %v", openErr)
+				s.logger.LogEvent(ctx, event)
+			} else {
+				s.zLogger.Error().Err(openErr).Str("scope", s.scope).Str("orgID", s.orgID).Msg("Audit event (event) was nil during GCM open failure in Verify method")
+			}
+		}
 		return fmt.Errorf("failed to verify field: %w", openErr)
 	}
 
