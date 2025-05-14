@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
