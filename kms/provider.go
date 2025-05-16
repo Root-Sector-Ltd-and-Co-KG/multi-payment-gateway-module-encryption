@@ -3,17 +3,20 @@ package kms
 
 import (
 	"context"
+	"encoding/base64" // Added for AEAD
 	"fmt"
 	"os" // Import os package
 	"strings"
 
 	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
 
-	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
+	wrapping "github.com/hashicorp/go-kms-wrapping/v2"     // Base v2 package
+	kmsaead "github.com/hashicorp/go-kms-wrapping/v2/aead" // AEAD wrapper
 	awskms "github.com/hashicorp/go-kms-wrapping/wrappers/awskms/v2"
 	azurekeyvault "github.com/hashicorp/go-kms-wrapping/wrappers/azurekeyvault/v2"
 	gcpckms "github.com/hashicorp/go-kms-wrapping/wrappers/gcpckms/v2"
 	transit "github.com/hashicorp/go-kms-wrapping/wrappers/transit/v2"
+
 	"github.com/rs/zerolog"
 )
 
@@ -29,9 +32,9 @@ type provider struct {
 func NewProvider(config Config) (Provider, error) {
 	var wrapper wrapping.Wrapper
 	var err error
-	var keyID, location string // Variables to hold common info for logging
+	var keyID, location string  // Variables to hold common info for logging
+	ctx := context.Background() // Added for AEAD SetConfig, already used by helpers
 
-	// Initial log with just the type
 	log.Debug().
 		Str("provider", string(config.Type)).
 		Msg("Initializing KMS provider")
@@ -43,7 +46,7 @@ func NewProvider(config Config) (Provider, error) {
 		}
 		keyID = config.AWS.KeyID
 		location = config.AWS.Region
-		if err := validateAWSConfig(*config.AWS); err != nil {
+		if err = validateAWSConfig(*config.AWS); err != nil {
 			return nil, fmt.Errorf("invalid AWS KMS configuration: %w", err)
 		}
 		wrapper, err = createAWSWrapper(*config.AWS)
@@ -54,7 +57,7 @@ func NewProvider(config Config) (Provider, error) {
 		keyID = config.Azure.KeyID
 		// Azure doesn't have a direct 'region' equivalent in the same way, log VaultAddress
 		location = config.Azure.VaultAddress
-		if err := validateAzureConfig(*config.Azure); err != nil {
+		if err = validateAzureConfig(*config.Azure); err != nil {
 			return nil, fmt.Errorf("invalid Azure Key Vault configuration: %w", err)
 		}
 		wrapper, err = createAzureWrapper(*config.Azure)
@@ -62,9 +65,8 @@ func NewProvider(config Config) (Provider, error) {
 		if config.GCP == nil {
 			return nil, fmt.Errorf("GCP configuration is missing for provider type %s", config.Type)
 		}
-		keyID = config.GCP.ResourceName // Use the full resource name as the primary identifier
-		// Validate first
-		if err := validateGCPConfig(*config.GCP); err != nil {
+		keyID = config.GCP.ResourceName
+		if err = validateGCPConfig(*config.GCP); err != nil {
 			return nil, fmt.Errorf("invalid GCP KMS configuration: %w", err)
 		}
 		// If validation passes, parsing for logging context is safe
@@ -78,25 +80,59 @@ func NewProvider(config Config) (Provider, error) {
 			return nil, fmt.Errorf("vault configuration is missing for provider type %s", config.Type)
 		}
 		keyID = config.Vault.KeyID
-		location = config.Vault.VaultAddress // Log Vault address as location context
-		if err := validateVaultConfig(*config.Vault); err != nil {
+		location = config.Vault.VaultAddress
+		if err = validateVaultConfig(*config.Vault); err != nil {
 			return nil, fmt.Errorf("invalid Vault configuration: %w", err)
 		}
 		wrapper, err = createVaultWrapper(*config.Vault)
+	case types.ProviderAead: // This is types.ProviderAead from the root types package
+		log.Debug().Str("provider", string(config.Type)).Msg("KMS.NewProvider: Initializing AEAD provider")
+		if config.AeadKeyBase64 == "" {
+			log.Error().Msg("KMS.NewProvider: config.AeadKeyBase64 is required for AEAD provider.")
+			return nil, fmt.Errorf("AEAD provider requires AeadKeyBase64")
+		}
+		if config.AeadKeyID == "" {
+			// Allow empty AeadKeyID if KeyID is to be used, but log it
+			log.Warn().Msg("AeadKeyID is empty for AEAD provider, will use BlobInfo.KeyInfo.KeyId if set by wrapper")
+		}
+
+		decodedKey, keyErr := base64.StdEncoding.DecodeString(config.AeadKeyBase64)
+		if keyErr != nil {
+			return nil, fmt.Errorf("failed to decode AeadKeyBase64: %w", keyErr)
+		}
+		if len(decodedKey) != 32 { // AES-256-GCM typically requires a 32-byte key
+			return nil, fmt.Errorf("decoded AEAD key must be 32 bytes for AES-256-GCM, got %d", len(decodedKey))
+		}
+
+		aeadWrapper := kmsaead.NewWrapper()
+
+		opts := []wrapping.Option{kmsaead.WithKey(decodedKey)} // Use kmsaead.WithKey
+		if config.AeadKeyID != "" {
+			opts = append(opts, wrapping.WithKeyId(config.AeadKeyID)) // Use base wrapping.WithKeyId
+		}
+
+		// Pass context to SetConfig
+		_, err = aeadWrapper.SetConfig(ctx, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure AEAD wrapper: %w", err)
+		}
+		wrapper = aeadWrapper
+		keyID = config.AeadKeyID // For logging
+		location = "local"       // For logging
 	default:
-		return nil, fmt.Errorf("unsupported provider type: %s", config.Type)
+		log.Error().Str("providerConfigType", string(config.Type)).Msg("KMS.NewProvider: Unsupported provider type in switch default")
+		return nil, fmt.Errorf("unsupported KMS provider type: %s", config.Type)
 	}
 
 	if err != nil {
-		log.Error().Err(err).Str("provider", string(config.Type)).Msg("Failed to create KMS provider")
+		log.Error().Err(err).Str("provider", string(config.Type)).Msg("Failed to create KMS provider wrapper")
 		return nil, fmt.Errorf("failed to create wrapper: %w", err)
 	}
 
-	// Log success with extracted keyID and location/address
 	log.Info().
 		Str("provider", string(config.Type)).
-		Str("keyIdentifier", keyID).      // Use a more generic name for logging
-		Str("locationContext", location). // Use a more generic name for logging
+		Str("keyIdentifier", keyID).
+		Str("locationContext", location).
 		Msg("KMS provider initialized successfully")
 
 	return &provider{

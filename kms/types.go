@@ -23,19 +23,6 @@ type Provider interface {
 	GetLastHealthCheckError() error
 }
 
-// ProviderType represents the type of KMS provider
-// Note: This might be redundant if types.ProviderType is sufficient.
-// Keeping it for now for clarity within this package, but could be consolidated.
-type ProviderType string
-
-// Provider type constants
-const (
-	ProviderAWS   ProviderType = "aws"
-	ProviderAzure ProviderType = "azure"
-	ProviderGCP   ProviderType = "gcp"
-	ProviderVault ProviderType = "vault"
-)
-
 // --- Provider Specific Config Structs ---
 
 // AWSConfig holds configuration specific to AWS KMS
@@ -70,10 +57,13 @@ type VaultConfig struct {
 
 // Config represents the KMS provider configuration, holding the type
 // and a pointer to the relevant provider-specific configuration.
+// It also includes direct fields for simpler AEAD provider configuration.
 type Config struct {
-	Type  types.ProviderType `json:"type" bson:"type"`
-	AWS   *AWSConfig         `json:"aws,omitempty" bson:"aws,omitempty"`
-	Azure *AzureConfig       `json:"azure,omitempty" bson:"azure,omitempty"`
-	GCP   *GCPConfig         `json:"gcp,omitempty" bson:"gcp,omitempty"`
-	Vault *VaultConfig       `json:"vault,omitempty" bson:"vault,omitempty"`
+	Type          types.ProviderType `json:"type" bson:"type"`
+	AWS           *AWSConfig         `json:"aws,omitempty" bson:"aws,omitempty"`
+	Azure         *AzureConfig       `json:"azure,omitempty" bson:"azure,omitempty"`
+	GCP           *GCPConfig         `json:"gcp,omitempty" bson:"gcp,omitempty"`
+	Vault         *VaultConfig       `json:"vault,omitempty" bson:"vault,omitempty"`
+	AeadKeyID     string             `json:"aeadKeyId,omitempty" bson:"aeadKeyId,omitempty"`         // Added for AEAD
+	AeadKeyBase64 string             `json:"aeadKeyBase64,omitempty" bson:"aeadKeyBase64,omitempty"` // Added for AEAD
 }

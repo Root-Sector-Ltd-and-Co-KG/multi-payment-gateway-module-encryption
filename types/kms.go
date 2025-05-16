@@ -12,6 +12,7 @@ const (
 	ProviderAzure ProviderType = "azure"
 	ProviderGCP   ProviderType = "gcp"
 	ProviderVault ProviderType = "vault"
+	ProviderAead  ProviderType = "aead"
 )
 
 // KMSCredentials represents KMS provider credentials
@@ -35,18 +36,20 @@ type KMSCredentials struct {
 
 // EncryptionConfig represents the encryption service configuration
 type EncryptionConfig struct {
-	Enabled      bool            `json:"enabled" bson:"enabled"`
-	Provider     ProviderType    `json:"provider" bson:"provider"`
-	KeyID        string          `json:"keyId" bson:"keyId"`                                   // Key identifier (ARN for AWS, URL for Azure, ResourceName for GCP, Key Name for Vault)
-	Region       string          `json:"region,omitempty" bson:"region,omitempty"`             // AWS Region (Only used by AWS)
-	VaultAddress string          `json:"vaultAddress,omitempty" bson:"vaultAddress,omitempty"` // Vault address, also used for Azure Vault URL base
-	VaultMount   string          `json:"vaultMount,omitempty" bson:"vaultMount,omitempty"`     // Vault transit mount path
-	Credentials  *KMSCredentials `json:"credentials,omitempty" bson:"credentials,omitempty"`   // Encrypted credentials
-	Cache        CacheConfig     `json:"cache" bson:"cache"`
-	AuditLog     AuditLogConfig  `json:"auditLog" bson:"auditLog"`
-	RotateAfter  time.Duration   `json:"rotateAfter" bson:"rotateAfter"`
-	CreatedAt    time.Time       `json:"createdAt" bson:"createdAt"`
-	UpdatedAt    time.Time       `json:"updatedAt" bson:"updatedAt"`
+	Enabled       bool            `json:"enabled" bson:"enabled"`
+	Provider      ProviderType    `json:"provider" bson:"provider"`
+	KeyID         string          `json:"keyId" bson:"keyId"`                                     // Key identifier (ARN for AWS, URL for Azure, ResourceName for GCP, Key Name for Vault)
+	Region        string          `json:"region,omitempty" bson:"region,omitempty"`               // AWS Region (Only used by AWS)
+	VaultAddress  string          `json:"vaultAddress,omitempty" bson:"vaultAddress,omitempty"`   // Vault address, also used for Azure Vault URL base
+	VaultMount    string          `json:"vaultMount,omitempty" bson:"vaultMount,omitempty"`       // Vault transit mount path
+	AeadKeyID     string          `json:"aeadKeyId,omitempty" bson:"aeadKeyId,omitempty"`         // Key ID for AEAD provider
+	AeadKeyBase64 string          `json:"aeadKeyBase64,omitempty" bson:"aeadKeyBase64,omitempty"` // Base64 encoded key for AEAD provider
+	Credentials   *KMSCredentials `json:"credentials,omitempty" bson:"credentials,omitempty"`     // Encrypted credentials
+	Cache         CacheConfig     `json:"cache" bson:"cache"`
+	AuditLog      AuditLogConfig  `json:"auditLog" bson:"auditLog"`
+	RotateAfter   time.Duration   `json:"rotateAfter" bson:"rotateAfter"`
+	CreatedAt     time.Time       `json:"createdAt" bson:"createdAt"`
+	UpdatedAt     time.Time       `json:"updatedAt" bson:"updatedAt"`
 }
 
 // EncryptionProcessStatusSummary represents a summary status of an encryption process, suitable for API responses.
