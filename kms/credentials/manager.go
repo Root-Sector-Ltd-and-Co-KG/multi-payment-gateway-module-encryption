@@ -124,11 +124,6 @@ func (m *credentialManager) EncryptCredentials(config *types.EncryptionConfig) e
 	// Update the config with the new encrypted credentials
 	config.Credentials = newCreds
 
-	// Debug: Log final credentials
-	log.Debug().
-		Interface("finalCredentials", config.Credentials).
-		Msg("Final credentials after encryption")
-
 	return nil
 }
 
