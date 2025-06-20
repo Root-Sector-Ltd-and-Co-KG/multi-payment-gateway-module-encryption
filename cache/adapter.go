@@ -7,8 +7,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/root-sector/multi-payment-gateway-module-encryption/interfaces"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/interfaces"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
 )
 
 // CacheAdapter adapts the internal cache interface to the encryption cache interface.

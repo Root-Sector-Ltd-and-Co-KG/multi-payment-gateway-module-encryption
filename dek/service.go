@@ -16,11 +16,11 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/root-sector/multi-payment-gateway-module-encryption/audit"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/field"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/interfaces"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/kms"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/audit"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/field"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/interfaces"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/kms"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
 )
 
 // Define custom type for context keys

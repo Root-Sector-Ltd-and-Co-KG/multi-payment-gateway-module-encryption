@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/root-sector/multi-payment-gateway-module-encryption/interfaces"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/interfaces"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
 )
 
 // GarnetAdapter adapts the internal cache to our encryption cache interface, adding namespacing.

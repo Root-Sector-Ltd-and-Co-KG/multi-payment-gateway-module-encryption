@@ -8,7 +8,7 @@ import (
 	"time"
 
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
 )
 
 // Cache Interfaces

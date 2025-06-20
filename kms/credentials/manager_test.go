@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/root-sector/multi-payment-gateway-module-encryption/kms"
-	encTypes "github.com/root-sector/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/kms"
+	encTypes "github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
 )
 
 func TestToKMSConfig(t *testing.T) {

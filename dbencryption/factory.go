@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/root-sector/multi-payment-gateway-module-encryption/interfaces"
-	"github.com/root-sector/multi-payment-gateway-module-encryption/kms"
-	encTypes "github.com/root-sector/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/interfaces"
+	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/kms"
+	encTypes "github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
