@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/types"
 	"github.com/rs/zerolog/log"
 )
 

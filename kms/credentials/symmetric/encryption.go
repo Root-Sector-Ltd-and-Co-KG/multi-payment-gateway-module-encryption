@@ -9,7 +9,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/interfaces"
+	"github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/interfaces"
 )
 
 // encryption implements the interfaces.SymmetricEncryptor interface

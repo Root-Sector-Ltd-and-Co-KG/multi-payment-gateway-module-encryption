@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	encTypes "github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
+	encTypes "github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/types"
 )
 
 // --- Test Cases for Validation Functions ---

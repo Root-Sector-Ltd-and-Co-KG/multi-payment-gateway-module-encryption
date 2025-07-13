@@ -3,7 +3,7 @@ package kms
 import (
 	"context"
 
-	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/types"
 
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 )

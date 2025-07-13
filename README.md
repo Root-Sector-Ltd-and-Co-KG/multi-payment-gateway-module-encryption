@@ -1,13 +1,13 @@
-# Multi-Payment Gateway Encryption Module
+# Payment Gateway App Encryption Module
 
-This module provides encryption functionality for the Multi-Payment Gateway system, offering a comprehensive suite of encryption services including field-level encryption, key management, and audit logging.
+This module provides encryption functionality for the Payment Gateway App, offering a comprehensive suite of encryption services including field-level encryption, key management, and audit logging.
 
 ## Import Structure
 
 This module uses the following import path structure:
 
 ```go
-import "github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/[package]"
+import "github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/[package]"
 ```
 
 Where `[package]` is one of:
@@ -67,16 +67,16 @@ Where `[package]` is one of:
 Add the following to your `go.mod` file:
 
 ```go
-replace github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption => ../multi-payment-gateway-module-encryption
+replace github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto => ../payment-gateway-lib-crypto
 ```
 
 or `go.work` file in your root directory:
 
 ```go
-go 1.24.4
+go 1.24.5
 
 use (
-	./multi-payment-gateway-module-encryption
+	./payment-gateway-lib-crypto
 )
 ```
 
@@ -85,7 +85,7 @@ use (
 Use the standard Go module dependency mechanism:
 
 ```go
-require github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption v1.0.1
+require github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto v1.0.1
 ```
 
 ## Directory Structure
@@ -115,7 +115,7 @@ The module requires Go 1.24.1 or later and includes the following major dependen
 If you encounter import errors like:
 
 ```
-could not import github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/... (no required module provides package "github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/...")
+could not import github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/... (no required module provides package "github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/...")
 ```
 
 Make sure that:

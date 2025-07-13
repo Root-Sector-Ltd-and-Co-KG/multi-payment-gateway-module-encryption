@@ -7,8 +7,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/interfaces"
-	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/interfaces"
+	"github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/types"
 )
 
 // ValidateAndCleanPlaintextFields recursively walks through a struct and validates/cleans

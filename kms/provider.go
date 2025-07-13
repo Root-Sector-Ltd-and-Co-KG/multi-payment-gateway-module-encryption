@@ -8,7 +8,7 @@ import (
 	"os" // Import os package
 	"strings"
 
-	"github.com/root-sector-ltd-and-co-kg/multi-payment-gateway-module-encryption/types"
+	"github.com/root-sector-ltd-and-co-kg/payment-gateway-lib-crypto/types"
 
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"     // Base v2 package
 	kmsaead "github.com/hashicorp/go-kms-wrapping/v2/aead" // AEAD wrapper
